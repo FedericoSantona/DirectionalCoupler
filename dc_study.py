@@ -58,10 +58,10 @@ FREEZE_L_C = True  # If True (default), compute L_c once at design wavelength an
 sbend_length = 8
 sbend_height = 0.5
 wg_length = 5
-wg_width = 1.30
-wg_thick = 0.35
+wg_width = 1.15
+wg_thick = 0.32
 wl_0 = 1.55
-coupling_gap = 0.235
+coupling_gap = 0.275
 
 #calculate the size of the simulation domain (coupling_length will be computed later)
 size_x = 2*(wg_length+sbend_length) + 0.0  # Will be computed from derived coupling_length
