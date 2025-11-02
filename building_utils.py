@@ -34,11 +34,69 @@ def resolve_mode_spec(param, pol):
     return _resolve_mode_spec(param, pol)
 
 # --- recompute derived domain sizes when a parameter changes ---
-def update_param_derived(p):
+def update_param_derived(p, lambda_eval=None):
+    """
+    Recompute derived parameters including coupling_length from supermode analysis.
+    
+    Args:
+        p: Parameter namespace
+        lambda_eval: Optional wavelength for per-lambda L_c recomputation (if freeze_l_c=False)
+    """
+    # Import here to avoid circular dependency
+    from simulation_utils import compute_coupling_length
+    
+    # Determine wavelength for coupling_length computation
+    freeze = getattr(p, 'freeze_l_c', True)  # Default: freeze at design wavelength
+    
+    if freeze:
+        # Use design wavelength (compute once, reuse for all λ)
+        lambda0 = getattr(p, 'lambda_single', p.wl_0)
+    else:
+        # Per-lambda recomputation (for CMT validation)
+        lambda0 = lambda_eval if lambda_eval is not None else getattr(p, 'lambda_single', p.wl_0)
+    
+    # Check if geometry parameters changed (force recomputation if they did)
+    current_geometry = (
+        float(getattr(p, 'wg_width', 0)),
+        float(getattr(p, 'coupling_gap', 0)),
+        float(getattr(p, 'wg_thick', 0)),
+        float(getattr(p.medium.SiN, 'permittivity', 1.0)),
+        float(getattr(p.medium.SiO2, 'permittivity', 1.0)),
+    )
+    
+    # Get stored geometry from last computation
+    last_geometry = getattr(p, '_last_geometry_for_lc', None)
+    geometry_changed = (last_geometry != current_geometry)
+    
+    # Compute coupling_length if:
+    # 1. Not set yet, OR
+    # 2. freeze_l_c=False (allows recomputation), OR
+    # 3. Geometry changed (force recomputation even if freeze_l_c=True)
+    if not hasattr(p, 'coupling_length') or p.coupling_length is None or not freeze or geometry_changed:
+        # Compute derived coupling_length
+        p.coupling_length = compute_coupling_length(
+            param=p,
+            lambda0=lambda0,
+            trim_factor=getattr(p, 'coupling_trim_factor', 0.075),
+            cache_dir="data"
+        )
+        p._last_geometry_for_lc = current_geometry  # Store/update geometry signature
+    # else: freeze_l_c=True and geometry unchanged - keep existing value
+    
+    # Recompute domain sizes (coupling_length is now set)
     p.size_x = 2 * (p.wg_length + p.sbend_length) + p.coupling_length
     p.size_z = 3 * p.wl_0 + p.wg_thick
     p.freq_0 = td.C_0 / p.wl_0
-    p.size_y = 2 * (p.sbend_height + p.wl_0) + p.wg_width + p.coupling_gap
+    # Adaptive y padding to keep structures at least ~lambda0/2 from PML with margin.
+    # size_y = 2*(sbend_height + wl_0) + wg_width + coupling_gap + max(0, wg_width - wl_0) + pad_extra
+    pad_extra = getattr(p, "pad_extra", 0.05)
+    p.size_y = (
+        2 * (p.sbend_height + p.wl_0)
+        + p.wg_width
+        + p.coupling_gap
+        + max(0.0, float(p.wg_width) - float(p.wl_0))
+        + float(pad_extra)
+    )
 
 # This function creates the directional coupler geometry.
 
@@ -175,9 +233,9 @@ def make_source(param, pol="te"):
 
     # Choose a wavelength span to excite (here ~100 nm around 1.55 µm),
     # then convert to an approximate frequency width: Δf ≈ c * Δλ / λ0^2
-    dlam = getattr(param, "source_dlambda", 0.06)
+    dlam = param.source_dlambda
     df = td.C_0 * dlam / (param.wl_0 ** 2)
-    num_freqs = int(getattr(param, "source_num_freqs", 20))
+    num_freqs = int(param.source_num_freqs)
 
     source_kwargs = dict(
         name=f"mode_{pol_key}_0",
@@ -202,9 +260,9 @@ def make_monitors(param, pol='te'):
         filter_pol=None,
         target_neff=getattr(mode_spec, "target_neff", None),
     )
-    lam_start = getattr(param, "monitor_lambda_start", 1.530)
-    lam_stop = getattr(param, "monitor_lambda_stop", 1.565)
-    lam_points = int(getattr(param, "monitor_lambda_points", 36))
+    lam_start = param.monitor_lambda_start
+    lam_stop = param.monitor_lambda_stop
+    lam_points = int(param.monitor_lambda_points)
     lam_grid = np.linspace(lam_start, lam_stop, lam_points)
     freqs = td.C_0 / lam_grid
     mon_thru = td.ModeMonitor(

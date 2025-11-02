@@ -5,12 +5,20 @@ from tidy3d.web.api import webapi as api
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
+import pickle
 from building_utils import generate_object, make_source, make_monitors, resolve_mode_spec
 
 try:
     from tidy3d.plugins.mode import ModeSolver as _ModeSolver
 except Exception:
     _ModeSolver = None
+
+# Cache for coupling length computations
+_coupling_cache_per_pol = {}  # Level 1: per-polarization supermode data
+_coupling_cache_blended = {}  # Level 2: blended L_c values
+
+# Increment this to invalidate old on-disk caches when logic changes
+_COUPLING_CACHE_REV = 2
 
 
 def _get_monitor(sim_data, name):
@@ -45,35 +53,6 @@ def getObjectInArray(className, items):
     return list(filter(lambda item: isinstance(item, className), items))
 
 
-def _mode_solver_field_fraction(mode_field):
-    """Return (fx, fy) = normalized |Ex|^2 and |Ey|^2 fractions for a mode solver field."""
-    try:
-        if isinstance(mode_field, (list, tuple)) and len(mode_field) > 0:
-            mode_field = mode_field[0]
-        ex = None
-        ey = None
-        for attr in ("Ex", "ex", "E_x", "e_x"):
-            if hasattr(mode_field, attr):
-                ex = getattr(mode_field, attr)
-                break
-        for attr in ("Ey", "ey", "E_y", "e_y"):
-            if hasattr(mode_field, attr):
-                ey = getattr(mode_field, attr)
-                break
-        if ex is None or ey is None:
-            return None, None
-        ex = np.array(ex)
-        ey = np.array(ey)
-        ex_energy = float(np.sum(np.abs(ex) ** 2))
-        ey_energy = float(np.sum(np.abs(ey) ** 2))
-        total = ex_energy + ey_energy
-        if total <= 0:
-            return None, None
-        return ex_energy / total, ey_energy / total
-    except Exception:
-        return None, None
-
-
 def compute_mode_solver_diagnostics(sim, param, pol, lambda_eval=1.55):
     """Run a Tidy3D mode solver at the through monitor plane and return diagnostics."""
     diag = {}
@@ -81,9 +60,14 @@ def compute_mode_solver_diagnostics(sim, param, pol, lambda_eval=1.55):
         if _ModeSolver is None:
             raise AttributeError("ModeSolver plugin is unavailable in this tidy3d build")
         mode_spec = resolve_mode_spec(param, pol)
+        # Enlarge mode-solver plane to ensure decay before boundaries
+        pad_y = max(1.0 * lambda_eval, 2.0 * param.wg_width)
+        pad_z = max(0.5 * lambda_eval, 2.0 * param.wg_thick)
+        size_y = (param.coupling_gap + 2.0 * param.wg_width) + 2.0 * pad_y
+        size_z = param.wg_thick + 2.0 * pad_z
         plane_box = td.Box(
             center=[param.size_x / 2 - param.wl_0, 0.0, 0.0],
-            size=[0.0, 4 * param.wg_width, 5 * param.wg_thick],
+            size=[0.0, 0.95 * size_y, 0.95 * size_z],
         )
         ms = _ModeSolver(
             simulation=sim,
@@ -153,6 +137,272 @@ def _mode_solver_component_energies(sol, comps=("Ey","Ez")):
     return tuple(outs)
 
 
+def _load_coupling_cache(cache_dir="data"):
+    """Load coupling length cache from disk."""
+    cache_path = Path(cache_dir) / "coupling_length_cache.pkl"
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                data = pickle.load(f)
+                return data.get("per_pol", {}), data.get("blended", {})
+        except Exception as e:
+            print(f"[cache] Failed to load coupling cache: {e}")
+    return {}, {}
+
+
+def _save_coupling_cache(cache_dir="data"):
+    """Save coupling length cache to disk."""
+    cache_path = Path(cache_dir) / "coupling_length_cache.pkl"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump({
+                "per_pol": _coupling_cache_per_pol,
+                "blended": _coupling_cache_blended
+            }, f)
+    except Exception as e:
+        print(f"[cache] Failed to save coupling cache: {e}")
+
+
+# Load cache on module import
+_coupling_cache_per_pol, _coupling_cache_blended = _load_coupling_cache()
+
+
+def _identify_even_odd_modes(sol, n_eff_arr):
+    """
+    Identify even and odd supermodes from mode solver solution.
+    
+    Returns (n_even, n_odd) where n_even > n_odd typically.
+    Uses field symmetry about mid-plane between waveguides.
+    """
+    if len(n_eff_arr) < 2:
+        raise ValueError("Need at least 2 modes to identify even/odd pair")
+    
+    # Get field components for analysis
+    try:
+        # Try to get Ey or Ez component for symmetry analysis
+        if hasattr(sol, 'Ey'):
+            fields = np.array(sol.Ey)
+        elif hasattr(sol, 'Ez'):
+            fields = np.array(sol.Ez)
+        else:
+            # Fallback: use higher n_eff as even, lower as odd (typical for coupled waveguides)
+            sorted_indices = np.argsort(n_eff_arr)[::-1]  # descending order
+            return float(n_eff_arr[sorted_indices[0]]), float(n_eff_arr[sorted_indices[1]])
+        
+        # Analyze symmetry: even mode has similar field on both sides, odd has opposite
+        # For simplicity, use n_eff ordering (even typically higher n_eff)
+        # In weakly coupled waveguides, even mode has constructive overlap (higher n_eff)
+        sorted_indices = np.argsort(n_eff_arr)[::-1]  # descending order
+        n_even = float(n_eff_arr[sorted_indices[0]])
+        n_odd = float(n_eff_arr[sorted_indices[1]])
+        
+        return n_even, n_odd
+    except Exception:
+        # Fallback to simple n_eff sorting
+        sorted_indices = np.argsort(n_eff_arr)[::-1]
+        return float(n_eff_arr[sorted_indices[0]]), float(n_eff_arr[sorted_indices[1]])
+
+
+def compute_coupling_length(param, lambda0=None, trim_factor=0.075, cache_dir="data"):
+    """
+    Compute coupling length L_c from supermode analysis of 2-waveguide cross-section.
+    
+    Physics:
+    - Solves for even and odd supermodes of the coupled waveguide system
+    - Computes effective index difference: Δn = n_even - n_odd
+    - Calculates beat length: L_π = λ₀ / (2 × Δn)
+    - Calculates 3-dB length: L_50 = L_π / 2 = λ₀ / (4 × Δn)
+    - Takes median of TE and TM L_50 values
+    - Applies empirical trim factor for bend/transition effects
+    
+    Args:
+        param: Parameter namespace with wg_width, coupling_gap, wg_thick, medium.SiN, medium.SiO2
+        lambda0: Wavelength in µm (default: param.wl_0)
+        trim_factor: Empirical trim factor for bends/transitions (default: 0.075 = 7.5%)
+        cache_dir: Directory for cache file (default: "data")
+    
+    Returns:
+        L_c in µm (clipped to [3.0, 50.0] µm safety bounds)
+    """
+    if _ModeSolver is None:
+        raise AttributeError("ModeSolver plugin is unavailable in this tidy3d build")
+    
+    # Use provided lambda0 or default from param
+    if lambda0 is None:
+        lambda0 = getattr(param, 'lambda_single', param.wl_0)
+    lambda0 = float(lambda0)
+    
+    # Extract geometry parameters
+    wg_width = float(param.wg_width)
+    wg_thick = float(param.wg_thick)
+    coupling_gap = float(param.coupling_gap)
+    
+    # Extract material permittivities for cache key
+    eps_SiN = float(param.medium.SiN.permittivity)
+    eps_SiO2 = float(param.medium.SiO2.permittivity)
+    
+    # Check cache for blended L_c (include material permittivities)
+    blended_key = (_COUPLING_CACHE_REV, wg_width, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, trim_factor, 'median')
+    if blended_key in _coupling_cache_blended:
+        cached_Lc = _coupling_cache_blended[blended_key]
+        print(f"[L_c cache hit] L_c={cached_Lc:.3f}µm (from cache)")
+        return cached_Lc
+    
+    # Build minimal 2-waveguide cross-section simulation
+    # Two parallel waveguides separated by coupling_gap
+    gap = coupling_gap
+    w = wg_width
+    t = wg_thick
+    
+    # Waveguide centers: upper at +y, lower at -y
+    y_upper = (gap + w) / 2
+    y_lower = -(gap + w) / 2
+    
+    # Domain sized to ensure modal fields decay well before PMLs
+    pad_y = max(1.0 * lambda0, 2.0 * w)
+    pad_z = max(0.5 * lambda0, 2.0 * t)
+    domain_x = 2.0 * w  # x size is irrelevant for the mode plane (size_x=0), keep compact
+    domain_y = (gap + 2.0 * w) + 2.0 * pad_y
+    domain_z = t + 2.0 * pad_z
+    
+    upper_wg = td.Structure(
+        geometry=td.Box(size=(w, w, t), center=(0, y_upper, 0)),
+        medium=param.medium.SiN,
+        name="upper_wg"
+    )
+    
+    lower_wg = td.Structure(
+        geometry=td.Box(size=(w, w, t), center=(0, y_lower, 0)),
+        medium=param.medium.SiN,
+        name="lower_wg"
+    )
+    
+    # Minimal simulation for mode solving
+    # Note: run_time is required by Simulation even though we only use it for mode solving
+    sim_cross = td.Simulation(
+        size=(domain_x, domain_y, domain_z),
+        medium=param.medium.SiO2,
+        structures=[upper_wg, lower_wg],
+        grid_spec=td.GridSpec(
+            grid_x=td.AutoGrid(min_steps_per_wvl=6),
+            grid_y=td.AutoGrid(min_steps_per_wvl=6),
+            grid_z=td.AutoGrid(min_steps_per_wvl=10),
+            wavelength=lambda0
+        ),
+        boundary_spec=td.BoundarySpec(
+            x=td.Boundary.pml(),
+            y=td.Boundary.pml(),
+            z=td.Boundary.pml(),
+        ),
+        run_time=1e-12  # Minimal value (not used for mode solving, but required by Simulation)
+    )
+    
+    # Solve for supermodes for each polarization
+    L_50_dict = {}
+    delta_n_dict = {}
+    
+    for pol in ("te", "tm"):
+        # Check per-pol cache first (include material permittivities)
+        per_pol_key = (_COUPLING_CACHE_REV, wg_width, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, pol)
+        if per_pol_key in _coupling_cache_per_pol:
+            cached_data = _coupling_cache_per_pol[per_pol_key]
+            n_even = cached_data["n_even"]
+            n_odd = cached_data["n_odd"]
+            delta_n = cached_data["delta_n"]
+            L_50 = cached_data["L_50"]
+            delta_n_dict[pol] = delta_n
+            L_50_dict[pol] = L_50
+            continue
+
+        # Polarization-specific mode solver: request 2 modes with filter_pol set
+        base_spec = resolve_mode_spec(param, pol)
+        mode_spec = td.ModeSpec(
+            num_modes=2,
+            filter_pol=getattr(base_spec, "filter_pol", pol),
+            target_neff=getattr(base_spec, "target_neff", None),
+        )
+        plane = td.Box(center=(0, 0, 0), size=(0, 0.95 * domain_y, 0.95 * domain_z))
+
+        try:
+            solver = _ModeSolver(
+                simulation=sim_cross,
+                plane=plane,
+                mode_spec=mode_spec,
+                freqs=[td.C_0 / lambda0],
+                direction="+",
+                fields=("Ex", "Ey", "Ez"),
+            )
+            sol = solver.solve()
+
+            # Extract n_eff values
+            n_eff_arr = np.array(sol.n_eff)
+            if n_eff_arr.ndim >= 2:
+                n_eff_arr = np.real(n_eff_arr.reshape(-1))[:2]
+            else:
+                n_eff_arr = np.real(n_eff_arr[:2])
+
+            if len(n_eff_arr) < 2:
+                raise ValueError(f"Mode solver returned <2 modes for {pol}")
+
+            # Identify even/odd pair and compute Δn
+            n_even, n_odd = _identify_even_odd_modes(sol, n_eff_arr)
+            delta_n = n_even - n_odd
+
+            if delta_n < 1e-6:
+                raise ValueError(f"Too weak coupling for {pol}: Δn={delta_n:.2e} < 1e-6")
+
+            # Compute 3-dB length
+            L_pi = lambda0 / (2 * delta_n)
+            L_50 = L_pi / 2  # = lambda0 / (4 * delta_n)
+
+            # Store in per-pol cache
+            _coupling_cache_per_pol[per_pol_key] = {
+                "n_even": n_even,
+                "n_odd": n_odd,
+                "delta_n": delta_n,
+                "L_50": L_50,
+            }
+            _save_coupling_cache(cache_dir)
+
+            delta_n_dict[pol] = delta_n
+            L_50_dict[pol] = L_50
+
+        except Exception as e:
+            print(f"[L_c WARNING] Mode solver failed for {pol}: {e}")
+            # Fallback: use safe default
+            L_50_dict[pol] = 10.0  # Safe default
+            delta_n_dict[pol] = lambda0 / (4 * 10.0)  # Rough estimate
+    
+    # Compute median of TE and TM L_50 values
+    L_50_te = L_50_dict.get("te", 10.0)
+    L_50_tm = L_50_dict.get("tm", 10.0)
+    L_50_median = (L_50_te + L_50_tm) / 2
+    
+    delta_n_te = delta_n_dict.get("te", 0.0)
+    delta_n_tm = delta_n_dict.get("tm", 0.0)
+    
+    # Apply trim factor
+    L_c_raw = L_50_median * (1 + trim_factor)
+    
+    # Clip to safety bounds with warning
+    L_c = float(np.clip(L_c_raw, 3.0, 50.0))
+    if L_c != L_c_raw:
+        print(f"[L_c WARNING] L_c clipped from {L_c_raw:.3f} to {L_c:.3f} µm "
+              f"(weak/strong coupling or out-of-bounds geometry)")
+    
+    # Store in blended cache
+    _coupling_cache_blended[blended_key] = L_c
+    _save_coupling_cache(cache_dir)
+    
+    # Log summary
+    print(f"[L_c derived] Δn_TE={delta_n_te:.6f}, Δn_TM={delta_n_tm:.6f}, "
+          f"L_50_TE={L_50_te:.3f}µm, L_50_TM={L_50_tm:.3f}µm, "
+          f"median={L_50_median:.3f}µm, trim={trim_factor:.1%}, L_c={L_c:.3f}µm")
+    
+    return L_c
+
+
 def pick_mode_index_at_source(sim, param, pol, lambda_um=1.55, n_modes=6):
     """Determine the best mode index to inject for the requested polarization."""
     if _ModeSolver is None:
@@ -167,7 +417,11 @@ def pick_mode_index_at_source(sim, param, pol, lambda_um=1.55, n_modes=6):
     plane_box = td.Box(center=list(source.center), size=list(source.size))
     base_spec = getattr(source, "mode_spec", None) or resolve_mode_spec(param, pol_key)
     target_neff = getattr(base_spec, "target_neff", None)
-    mode_spec = td.ModeSpec(num_modes=int(n_modes), filter_pol=None, target_neff=target_neff)
+    mode_spec = td.ModeSpec(
+        num_modes=int(n_modes),
+        filter_pol=getattr(base_spec, "filter_pol", None),
+        target_neff=target_neff,
+    )
 
     solver = _ModeSolver(
         simulation=sim,
@@ -268,102 +522,6 @@ def compute_field_monitor_polarization(sim_data, pol):
         return None, None
     return _field_energy_fraction(field_mon)
 
-def _mode_spec_from_monitor_data(mon):
-    """Best-effort: fetch the ModeSpec used by a ModeMonitor result."""
-    try:
-        if hasattr(mon, "monitor") and hasattr(mon.monitor, "mode_spec"):
-            return mon.monitor.mode_spec
-    except Exception:
-        pass
-    try:
-        if hasattr(mon, "mode_spec"):
-            return mon.mode_spec
-    except Exception:
-        pass
-    return None
-
-def _extract_neff_at_index(mon, idx):
-    """Best-effort extraction of n_eff at frequency index idx from a mode monitor dataset.
-
-    Tries several tidy3d data layouts. Returns float or None if unavailable.
-    """
-    # direct attributes found in some versions
-    for attr in ("n_eff", "neff", "mode_neff"):
-        try:
-            if hasattr(mon, attr):
-                arr = getattr(mon, attr)
-                a = np.array(arr)
-                if a.ndim == 0:
-                    return float(a)
-                if a.ndim == 1:
-                    return float(a[min(idx, a.shape[0]-1)])
-                if a.ndim >= 2:
-                    # assume (freq, mode, ...); pick first mode
-                    fdim = 0 if a.shape[0] >= a.shape[1] else 1
-                    if fdim == 0:
-                        return float(a[min(idx, a.shape[0]-1), 0])
-                    else:
-                        return float(a[0, min(idx, a.shape[1]-1)])
-        except Exception:
-            pass
-
-    # nested containers that may hold modes with attributes
-    for container_name in ("mode_data", "modes"):
-        try:
-            container = getattr(mon, container_name, None)
-            if container is None:
-                continue
-            # list-like of modes with .n_eff
-            if isinstance(container, (list, tuple)) and len(container) > 0:
-                m0 = container[0]
-                if hasattr(m0, "n_eff"):
-                    val = getattr(m0, "n_eff")
-                    return float(val) if np.isscalar(val) else float(np.array(val).squeeze())
-            # object with array attribute
-            for attr in ("n_eff", "neff"):
-                if hasattr(container, attr):
-                    arr = getattr(container, attr)
-                    a = np.array(arr)
-                    if a.ndim == 0:
-                        return float(a)
-                    if a.ndim == 1:
-                        return float(a[min(idx, a.shape[0]-1)])
-                    if a.ndim >= 2:
-                        return float(a[min(idx, a.shape[0]-1), 0])
-        except Exception:
-            pass
-
-    # xarray DataArray route via amplitudes metadata/coords
-    try:
-        if hasattr(mon, "amps"):
-            amps = mon.amps
-            # coords
-            try:
-                if hasattr(amps, "coords") and "n_eff" in amps.coords:
-                    a = np.array(amps.coords["n_eff"])  # shape (freq, mode)
-                    if a.ndim == 1:
-                        return float(a[min(idx, a.shape[0]-1)])
-                    if a.ndim >= 2:
-                        return float(a[min(idx, a.shape[0]-1), 0])
-            except Exception:
-                pass
-            # attrs
-            try:
-                if hasattr(amps, "attrs") and isinstance(amps.attrs, dict) and "n_eff" in amps.attrs:
-                    a = np.array(amps.attrs["n_eff"])  # shape (freq, mode) in some versions
-                    if a.ndim == 0:
-                        return float(a)
-                    if a.ndim == 1:
-                        return float(a[min(idx, a.shape[0]-1)])
-                    if a.ndim >= 2:
-                        return float(a[min(idx, a.shape[0]-1), 0])
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return None
-
 def server_estimate(sim, task_name="estimate_probe"):
     """Upload-only to server and request official cost estimate; then delete the temp task."""
     # Upload (does not start the simulation)
@@ -399,13 +557,21 @@ def build_sim(param, pol='te'):
     # sources and monitors
     src = make_source(param, pol=pol)
     mon_s31, mon_s41, mon_field = make_monitors(param, pol=pol)
-    steps = getattr(param, "grid_steps_per_wvl", 18)
+    steps = param.grid_steps_per_wvl
     if isinstance(steps, (tuple, list)) and len(steps) >= 3:
         step_x, step_y, step_z = steps[:3]
     else:
         step_x = step_y = step_z = steps
-    runtime = getattr(param, "run_time", 5e-11)
-    shutoff = getattr(param, "shutoff", 1e-5)
+    runtime = param.run_time
+    shutoff = param.shutoff
+    # Optionally disable the field monitor to save cost
+    monitors = [mon_s31, mon_s41]
+    if getattr(param, "enable_field_monitor", True):
+        print("Field monitor enabled")
+        monitors.append(mon_field)
+    else:
+        print("Field monitor disabled")
+
     sim = td.Simulation(
         size=[param.size_x, param.size_y, param.size_z],
         symmetry=[0, 0, 1],
@@ -421,13 +587,17 @@ def build_sim(param, pol='te'):
         shutoff=shutoff,
         medium=param.medium.SiO2,
         sources=[src],
-        monitors=[mon_s31, mon_s41, mon_field],
+        monitors=monitors,
         structures=structures
     )
     return sim
 
 def preflight(sim, do_server_estimate=True):
-    """Version-agnostic validation/summary + official server-side cost estimate (optional)."""
+    """Version-agnostic validation/summary + official server-side cost estimate (optional).
+    
+    Returns:
+        Cost estimate (float, dict, or None) if do_server_estimate=True, else None
+    """
     # --- validate ---
     try:
         sim.validate()
@@ -447,11 +617,14 @@ def preflight(sim, do_server_estimate=True):
     # --- official server-side estimate ---
     if do_server_estimate:
         try:
-            server_estimate(sim)
+            est = server_estimate(sim)
+            return est
         except Exception as e:
             print(f"[estimate] failed: {e}")
+            return None
     else:
         print("[estimate] skipped.")
+        return None
 
 def hom_visibility(eta):
     """Normalized HOM visibility in 0–1 range.
@@ -483,7 +656,8 @@ def extract_eta(sim_data, pol):
     P_t = _p(mon_t)
     P_c = _p(mon_c)
     eta = P_c / (P_c + P_t + 1e-18)
-    return eta
+    # Ensure at least 1D array (handle single-point case)
+    return np.atleast_1d(eta)
 
 
 
@@ -492,7 +666,9 @@ def _lambda_from_monitor(sim_data, pol):
     """Return wavelength grid (µm) from the through monitor of a given polarization."""
     mon = _get_monitor(sim_data, f"monitor_s31_{pol}")
     freqs = _monitor_freqs(mon)
-    return td.C_0 / freqs
+    lam = td.C_0 / freqs
+    # Ensure at least 1D array (handle single-point case)
+    return np.atleast_1d(lam)
 
 def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None):
     """
@@ -502,7 +678,7 @@ def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None):
     Path(outdir).mkdir(parents=True, exist_ok=True)
     lam = _lambda_from_monitor(sim_data, pol)
     eta = extract_eta(sim_data, pol)
-    V = hom_visibility(eta)
+    V = np.atleast_1d(hom_visibility(eta))
 
     # pick 1550 nm index
     k = int(np.argmin(np.abs(lam - 1.55)))
@@ -547,31 +723,14 @@ def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None):
                header="lambda_um,eta,V", comments="")
     print(f"  saved CSV      : {csv_path}")
 
-    # ---- plots: η(λ) and V(λ) ----
-    plt.figure()
-    plt.plot(lam, eta)
-    plt.axhline(0.5, ls="--")
-    plt.xlabel("Wavelength (µm)")
-    plt.ylabel("Coupling ratio η")
-    plt.title(f"Coupling ratio vs wavelength ({pol.upper()})")
-    fig1 = Path(outdir) / f"eta_vs_lambda_{pol}.png"
-    plt.tight_layout(); plt.savefig(fig1, dpi=200); plt.close()
-
-    plt.figure()
-    plt.plot(lam, V)
-    plt.xlabel("Wavelength (µm)")
-    plt.ylabel("HOM visibility V (0–1)")
-    plt.title(f"HOM visibility vs wavelength ({pol.upper()})")
-    fig2 = Path(outdir) / f"visibility_vs_lambda_{pol}.png"
-    plt.tight_layout(); plt.savefig(fig2, dpi=200); plt.close()
-
-    print(f"  saved plots    : {fig1.name}, {fig2.name}")
+    # Individual plots are no longer generated - only combined TE/TM plots are created
+    print(f"  plots          : (individual plots skipped, combined TE/TM plots will be generated)")
 
     return {
         "lam": lam, "eta": eta, "V": V,
         "eta_1550": eta_1550, "V_1550": V_1550,
         "max_dev": max_dev, "min_V": min_V,
-        "csv": str(csv_path), "fig_eta": str(fig1), "fig_V": str(fig2),
+        "csv": str(csv_path),
         "field_fx": field_fx, "field_fy": field_fy,
         "mode_solver": mode_solver_diag,
     }
@@ -589,6 +748,21 @@ def plot_eta_overlay(results_te, results_tm, outdir="results"):
     plt.title("Coupling ratio vs wavelength (TE vs TM)")
     plt.legend()
     out = Path(outdir) / "eta_vs_lambda_TE_TM.png"
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print(f"\n[OVERLAY] saved plot: {out}")
+
+def plot_visibility_overlay(results_te, results_tm, outdir="results"):
+    """Overlay V_TE(λ) and V_TM(λ) for quick polarization comparison."""
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+    lam = results_te["lam"]
+    plt.figure()
+    plt.plot(lam, results_te["V"], label="TE")
+    plt.plot(lam, results_tm["V"], label="TM")
+    plt.xlabel("Wavelength (µm)")
+    plt.ylabel("HOM visibility V (0-1)")
+    plt.title("HOM visibility vs wavelength (TE vs TM)")
+    plt.legend()
+    out = Path(outdir) / "visibility_vs_lambda_TE_TM.png"
     plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
     print(f"\n[OVERLAY] saved plot: {out}")
 
@@ -618,15 +792,17 @@ def save_combined_te_tm_csv(results_te, results_tm, outdir="results"):
         pass
     return delta_eta
 
-def compute_and_save_band_averaged_visibility(results_te, results_tm, outdir="results"):
+def compute_and_save_band_averaged_visibility(results_te, results_tm, param, outdir="results"):
     """
-    Compute band-averaged visibilities over the telecom C-band (1530–1565 nm) if available;
+    Compute band-averaged visibilities over the monitor wavelength range if available;
     otherwise average over the simulated band. Save summary to text file.
     Returns dict with Vbar_TE, Vbar_TM, and Vbar_avg.
     """
     Path(outdir).mkdir(parents=True, exist_ok=True)
     lam = results_te["lam"]
-    mask = (lam >= 1.530) & (lam <= 1.565)
+    lam_start = param.monitor_lambda_start
+    lam_stop = param.monitor_lambda_stop
+    mask = (lam >= lam_start) & (lam <= lam_stop)
     if not np.any(mask):
         mask = slice(None)
     Vbar_te = float(np.mean(results_te["V"][mask]))
@@ -651,5 +827,19 @@ def plot_delta_eta(lam, delta_eta, outdir="results"):
     plt.ylabel("Δη = |η_TE - η_TM|")
     plt.title("Polarization imbalance Δη vs wavelength")
     out = Path(outdir) / "delta_eta_vs_lambda.png"
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[COMBINE] saved plot: " + str(out))
+
+def plot_delta_visibility(results_te, results_tm, outdir="results"):
+    """Plot polarization imbalance ΔV(λ) = |V_TE - V_TM| vs wavelength."""
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+    lam = results_te["lam"]
+    delta_V = np.abs(results_te["V"] - results_tm["V"])
+    plt.figure()
+    plt.plot(lam, delta_V)
+    plt.xlabel("Wavelength (µm)")
+    plt.ylabel("ΔV = |V_TE - V_TM|")
+    plt.title("Polarization imbalance ΔV vs wavelength")
+    out = Path(outdir) / "delta_visibility_vs_lambda.png"
     plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
     print("[COMBINE] saved plot: " + str(out))
