@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 # import need be changed in some cases
 
 
-DRY_RUN = False # set False to actually simulate
+DRY_RUN = True # set False to actually simulate
 DO_SWEEP = False # set True to run a coarse one-parameter sweep
 # --- central hyperparameters (edit once, propagate everywhere) ---
 GRID_STEPS_PER_WVL_X = 6
@@ -160,7 +160,7 @@ def run_single(param, pol='te', task_tag='single', dry_run=False, lambda_single=
             # remove any stale index before probing
             param.mode_indices.pop(pol, None)
             probe_sim = build_sim(param, pol=pol)
-            mode_index = pick_mode_index_at_source(probe_sim, param, pol)
+            mode_index = pick_mode_index_at_source(probe_sim, param, pol, lambda_single=lambda_single, n_modes=6)
             param.mode_indices[pol] = mode_index
 
         sim = build_sim(param, pol=pol)

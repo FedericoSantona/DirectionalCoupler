@@ -43,7 +43,7 @@ def update_param_derived(p, lambda_eval=None):
         lambda_eval: Optional wavelength for per-lambda L_c recomputation (if freeze_l_c=False)
     """
     # Import here to avoid circular dependency
-    from simulation_utils import compute_coupling_length
+    from coupling_length import compute_Lc_symmetric
     
     # Determine wavelength for coupling_length computation
     freeze = getattr(p, 'freeze_l_c', True)  # Default: freeze at design wavelength
@@ -74,7 +74,7 @@ def update_param_derived(p, lambda_eval=None):
     # 3. Geometry changed (force recomputation even if freeze_l_c=True)
     if not hasattr(p, 'coupling_length') or p.coupling_length is None or not freeze or geometry_changed:
         # Compute derived coupling_length
-        p.coupling_length = compute_coupling_length(
+        p.coupling_length = compute_Lc_symmetric(
             param=p,
             lambda0=lambda0,
             trim_factor=getattr(p, 'coupling_trim_factor', 0.075),
