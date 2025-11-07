@@ -21,20 +21,20 @@ import matplotlib.pyplot as plt
 # import need be changed in some cases
 
 
-DRY_RUN = True # set False to actually simulate
+DRY_RUN = False # set False to actually simulate
 DO_SWEEP = False # set True to run a coarse one-parameter sweep
 # --- central hyperparameters (edit once, propagate everywhere) ---
 GRID_STEPS_PER_WVL_X = 6
 GRID_STEPS_PER_WVL_Y = 6
 GRID_STEPS_PER_WVL_Z = 10
-RUN_TIME = 1e-11
-SHUTOFF = 5e-4
+RUN_TIME = 1e-11 #s
+SHUTOFF = 5e-4 #s
 SOURCE_DLAMBDA = 0.06  # µm span driving the Gaussian pulse
 SOURCE_NUM_FREQS = 20  # tidy3d validation prefers <= 20
-MONITOR_LAMBDA_START = 1.530
-MONITOR_LAMBDA_STOP = 1.565
+MONITOR_LAMBDA_START = 1.530 #nm
+MONITOR_LAMBDA_STOP = 1.565 #nm
 MONITOR_LAMBDA_POINTS = 36  # Adjust as needed to trade spectral resolution for speed
-Y_PAD_EXTRA = 0.05  # µm additional y-padding to ensure ≥ λ0/2 clearance to PML
+Y_PAD_EXTRA = 0.2  # µm additional y-padding to ensure ≥ λ0/2 clearance to PML
 ENABLE_FIELD_MONITOR = False  # set False to disable costly field monitor
 
 # ---- multi-objective weights (Stage 1 defaults) ----
@@ -49,19 +49,22 @@ WEIGHTS = {
 
 # --- Coupling length derivation parameters ---
 COUPLING_TRIM_FACTOR = 0.05  # 7.5% empirical trim for bend/transition effects (configurable)
+COUPLING_LENGTH_BOUNDS = (3.0, 50.0)  # µm min/max bounds for derived L_c
 FREEZE_L_C = True  # If True (default), compute L_c once at design wavelength and reuse for all λ.
                    # If False, recompute L_c(λ) per wavelength (for CMT checks, not device spectra).
                    # Default=True keeps geometry fixed during wavelength sweeps.
 
 #script parameters, input parameters for the simulation
 # Note: coupling_length will be derived from supermode analysis in update_param_derived()
-sbend_length = 8
-sbend_height = 0.5
-wg_length = 5
-wg_width = 1.15
-wg_thick = 0.32
-wl_0 = 1.55
-coupling_gap = 0.275
+sbend_length = 8  #µm
+sbend_height = 0.5  #µm
+wg_length = 5  #µm
+wg_width = 1.15  #µm
+wg_thick = 0.32  #µm
+wl_0 = 1.55  #µm
+coupling_gap = 0.275  #µm
+delta_w = 0.01  #µm , Asymmetric width difference: w1 = wg_width + delta_w/2, w2 = wg_width - delta_w/2
+               # Default 0.0 for symmetric mode. Bounds: |delta_w| ≤ 0.3 µm (fabrication constraint)
 
 #calculate the size of the simulation domain (coupling_length will be computed later)
 size_x = 2*(wg_length+sbend_length) + 0.0  # Will be computed from derived coupling_length
@@ -95,8 +98,12 @@ param = SimpleNamespace(
     size_y=size_y,
     size_z=size_z,
     freq_0=freq_0,
-    coupling_gap=coupling_gap
+    coupling_gap=coupling_gap,
+    delta_w=delta_w  # Asymmetric width difference
 )
+# Validate delta_w bounds
+if abs(delta_w) > 0.3:
+    raise ValueError(f"delta_w={delta_w:.3f} µm exceeds fabrication constraint |delta_w| ≤ 0.3 µm")
 param.pad_extra = Y_PAD_EXTRA
 param.medium = SimpleNamespace(
     Vacuum=td.Medium(permittivity=1.0),
@@ -125,6 +132,7 @@ param.monitor_lambda_stop = MONITOR_LAMBDA_STOP
 param.monitor_lambda_points = MONITOR_LAMBDA_POINTS
 param.enable_field_monitor = ENABLE_FIELD_MONITOR
 param.coupling_trim_factor = COUPLING_TRIM_FACTOR
+param.coupling_length_bounds = COUPLING_LENGTH_BOUNDS
 param.freeze_l_c = FREEZE_L_C  # Controls whether L_c is wavelength-dependent
 
 # Compute derived coupling_length before building geometry
@@ -160,7 +168,14 @@ def run_single(param, pol='te', task_tag='single', dry_run=False, lambda_single=
             # remove any stale index before probing
             param.mode_indices.pop(pol, None)
             probe_sim = build_sim(param, pol=pol)
-            mode_index = pick_mode_index_at_source(probe_sim, param, pol, lambda_single=lambda_single, n_modes=6)
+            lambda_probe = lambda_single or getattr(param, "wl_0", 1.55)
+            mode_index = pick_mode_index_at_source(
+                probe_sim,
+                param,
+                pol,
+                lambda_um=lambda_probe,
+                n_modes=6,
+            )
             param.mode_indices[pol] = mode_index
 
         sim = build_sim(param, pol=pol)
@@ -211,6 +226,7 @@ if __name__ == "__main__":
             GRID3D = {
                 "coupling_gap":    np.round(np.linspace(0.24, 0.34, 2), 3),   # µm
                 "wg_width":        np.round(np.linspace(1.20, 1.60, 2), 3),   # µm
+                "delta_w":         np.round(np.linspace(-0.2, 0.2, 5), 3),    # µm asymmetric width difference
                 # coupling_length is now derived, not swept in main grid
             }
             
@@ -234,7 +250,8 @@ if __name__ == "__main__":
                 run_single_fn=run_single,
                 dry_run=DRY_RUN, 
                 save_top_k=10, 
-                lambda_single=1.55
+                lambda_single=1.55,
+                grid_delta_w=GRID3D.get("delta_w")  # Pass delta_w grid if present
             )
       
     else:

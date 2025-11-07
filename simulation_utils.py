@@ -55,10 +55,14 @@ def compute_mode_solver_diagnostics(sim, param, pol, lambda_eval=1.55):
         if _ModeSolver is None:
             raise AttributeError("ModeSolver plugin is unavailable in this tidy3d build")
         mode_spec = resolve_mode_spec(param, pol)
+        # Extract arm widths: w1 (upper), w2 (lower)
+        w1 = getattr(param, 'wg_width_left', param.wg_width)
+        w2 = getattr(param, 'wg_width_right', param.wg_width)
+        w_max = max(w1, w2)  # Use wider arm for plane sizing
         # Enlarge mode-solver plane to ensure decay before boundaries
-        pad_y = max(1.0 * lambda_eval, 2.0 * param.wg_width)
+        pad_y = max(1.0 * lambda_eval, 2.0 * w_max)
         pad_z = max(0.5 * lambda_eval, 2.0 * param.wg_thick)
-        size_y = (param.coupling_gap + 2.0 * param.wg_width) + 2.0 * pad_y
+        size_y = (param.coupling_gap + w1 + w2) + 2.0 * pad_y
         size_z = param.wg_thick + 2.0 * pad_z
         plane_box = td.Box(
             center=[param.size_x / 2 - param.wl_0, 0.0, 0.0],

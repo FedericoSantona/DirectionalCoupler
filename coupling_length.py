@@ -13,238 +13,31 @@ _coupling_cache_blended = {}  # Level 2: blended L_c values
 
 
 
-def compute_Lc_symmetric(param, lambda0=None, trim_factor=0.075, cache_dir="data"):
+
+
+
+def compute_Lc(
+    param,
+    lambda0=None,
+    trim_factor=0.075,
+    cache_dir="data",
+    blend_policy="median",
+    length_bounds=None,
+):
     """
-    Compute coupling length L_c from supermode analysis of 2-waveguide cross-section.
-    
-    Physics:
-    - Solves for even and odd supermodes of the coupled waveguide system
-    - Computes effective index difference: Δn = n_even - n_odd
-    - Calculates beat length: L_π = λ₀ / (2 × Δn)
-    - Calculates 3-dB length: L_50 = L_π / 2 = λ₀ / (4 × Δn)
-    - Takes median of TE and TM L_50 values
-    - Applies empirical trim factor for bend/transition effects
+    Compute coupling length L_c for directional coupler (symmetric or asymmetric).
+    Gracefully handles symmetric case (delta_w=0) where Δ→0 and math reduces to symmetric formula.
     
     Args:
-        param: Parameter namespace with wg_width, coupling_gap, wg_thick, medium.SiN, medium.SiO2
-        lambda0: Wavelength in µm (default: param.wl_0)
-        trim_factor: Empirical trim factor for bends/transitions (default: 0.075 = 7.5%)
-        cache_dir: Directory for cache file (default: "data")
-    
-    Returns:
-        L_c in µm (clipped to [3.0, 50.0] µm safety bounds)
-    """
-    if _ModeSolver is None:
-        raise AttributeError("ModeSolver plugin is unavailable in this tidy3d build")
-    
-    # Use provided lambda0 or default from param
-    if lambda0 is None:
-        lambda0 = getattr(param, 'lambda_single', param.wl_0)
-    lambda0 = float(lambda0)
-    
-    # Extract geometry parameters
-    wg_width = float(param.wg_width)
-    wg_thick = float(param.wg_thick)
-    coupling_gap = float(param.coupling_gap)
-    
-    # Extract material permittivities for cache key
-    eps_SiN = float(param.medium.SiN.permittivity)
-    eps_SiO2 = float(param.medium.SiO2.permittivity)
-    
-    # Check cache for blended L_c (include material permittivities)
-    blended_key = (_COUPLING_CACHE_REV, wg_width, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, trim_factor, 'median')
-    if blended_key in _coupling_cache_blended:
-        cached_Lc = _coupling_cache_blended[blended_key]
-        # Retrieve TE and TM L_50 values from per-pol cache for detailed output
-        L_c_te = None
-        L_c_tm = None
-        for pol in ("te", "tm"):
-            per_pol_key = (_COUPLING_CACHE_REV, wg_width, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, pol)
-            if per_pol_key in _coupling_cache_per_pol:
-                cached_data = _coupling_cache_per_pol[per_pol_key]
-                L_50 = cached_data["L_50"]
-                L_c_pol = L_50 * (1 + trim_factor)
-                if pol == "te":
-                    L_c_te = float(np.clip(L_c_pol, 3.0, 50.0))
-                else:
-                    L_c_tm = float(np.clip(L_c_pol, 3.0, 50.0))
-        
-        # Print with TE and TM values if available
-        if L_c_te is not None and L_c_tm is not None:
-            print(f"[L_c cache hit] L_c_TE={L_c_te:.3f}µm, L_c_TM={L_c_tm:.3f}µm, L_c_median={cached_Lc:.3f}µm (from cache)")
-        else:
-            print(f"[L_c cache hit] L_c={cached_Lc:.3f}µm (from cache)")
-        return cached_Lc
-    
-    # Build minimal 2-waveguide cross-section simulation
-    # Two parallel waveguides separated by coupling_gap
-    gap = coupling_gap
-    w = wg_width
-    t = wg_thick
-    
-    # Waveguide centers: upper at +y, lower at -y
-    y_upper = (gap + w) / 2
-    y_lower = -(gap + w) / 2
-    
-    # Domain sized to ensure modal fields decay well before PMLs
-    pad_y = max(1.0 * lambda0, 2.0 * w)
-    pad_z = max(0.5 * lambda0, 2.0 * t)
-    domain_x = 2.0 * w  # x size is irrelevant for the mode plane (size_x=0), keep compact
-    domain_y = (gap + 2.0 * w) + 2.0 * pad_y
-    domain_z = t + 2.0 * pad_z
-    
-    upper_wg = td.Structure(
-        geometry=td.Box(size=(w, w, t), center=(0, y_upper, 0)),
-        medium=param.medium.SiN,
-        name="upper_wg"
-    )
-    
-    lower_wg = td.Structure(
-        geometry=td.Box(size=(w, w, t), center=(0, y_lower, 0)),
-        medium=param.medium.SiN,
-        name="lower_wg"
-    )
-    
-    # Minimal simulation for mode solving
-    # Note: run_time is required by Simulation even though we only use it for mode solving
-    sim_cross = td.Simulation(
-        size=(domain_x, domain_y, domain_z),
-        medium=param.medium.SiO2,
-        structures=[upper_wg, lower_wg],
-        grid_spec=td.GridSpec(
-            grid_x=td.AutoGrid(min_steps_per_wvl=6),
-            grid_y=td.AutoGrid(min_steps_per_wvl=6),
-            grid_z=td.AutoGrid(min_steps_per_wvl=10),
-            wavelength=lambda0
-        ),
-        boundary_spec=td.BoundarySpec(
-            x=td.Boundary.pml(),
-            y=td.Boundary.pml(),
-            z=td.Boundary.pml(),
-        ),
-        run_time=1e-12  # Minimal value (not used for mode solving, but required by Simulation)
-    )
-    
-    # Solve for supermodes for each polarization
-    L_50_dict = {}
-    delta_n_dict = {}
-    
-    for pol in ("te", "tm"):
-        # Check per-pol cache first (include material permittivities)
-        per_pol_key = (_COUPLING_CACHE_REV, wg_width, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, pol)
-        if per_pol_key in _coupling_cache_per_pol:
-            cached_data = _coupling_cache_per_pol[per_pol_key]
-            n_even = cached_data["n_even"]
-            n_odd = cached_data["n_odd"]
-            delta_n = cached_data["delta_n"]
-            L_50 = cached_data["L_50"]
-            delta_n_dict[pol] = delta_n
-            L_50_dict[pol] = L_50
-            continue
-
-        # Polarization-specific mode solver: request 2 modes with filter_pol set
-        base_spec = resolve_mode_spec(param, pol)
-        mode_spec = td.ModeSpec(
-            num_modes=2,
-            filter_pol=getattr(base_spec, "filter_pol", pol),
-            target_neff=getattr(base_spec, "target_neff", None),
-        )
-        plane = td.Box(center=(0, 0, 0), size=(0, 0.95 * domain_y, 0.95 * domain_z))
-
-        try:
-            solver = _ModeSolver(
-                simulation=sim_cross,
-                plane=plane,
-                mode_spec=mode_spec,
-                freqs=[td.C_0 / lambda0],
-                direction="+",
-                fields=("Ex", "Ey", "Ez"),
-            )
-            sol = solver.solve()
-
-            # Extract n_eff values
-            n_eff_arr = np.array(sol.n_eff)
-            if n_eff_arr.ndim >= 2:
-                n_eff_arr = np.real(n_eff_arr.reshape(-1))[:2]
-            else:
-                n_eff_arr = np.real(n_eff_arr[:2])
-
-            if len(n_eff_arr) < 2:
-                raise ValueError(f"Mode solver returned <2 modes for {pol}")
-
-            # Identify even/odd pair and compute Δn
-            n_even, n_odd = _identify_even_odd_modes(sol, n_eff_arr)
-            delta_n = n_even - n_odd
-
-            if delta_n < 1e-6:
-                raise ValueError(f"Too weak coupling for {pol}: Δn={delta_n:.2e} < 1e-6")
-
-            # Compute 3-dB length
-            L_pi = lambda0 / (2 * delta_n)
-            L_50 = L_pi / 2  # = lambda0 / (4 * delta_n)
-
-            # Store in per-pol cache
-            _coupling_cache_per_pol[per_pol_key] = {
-                "n_even": n_even,
-                "n_odd": n_odd,
-                "delta_n": delta_n,
-                "L_50": L_50,
-            }
-            _save_coupling_cache(cache_dir)
-
-            delta_n_dict[pol] = delta_n
-            L_50_dict[pol] = L_50
-
-        except Exception as e:
-            print(f"[L_c WARNING] Mode solver failed for {pol}: {e}")
-            # Fallback: use safe default
-            L_50_dict[pol] = 10.0  # Safe default
-            delta_n_dict[pol] = lambda0 / (4 * 10.0)  # Rough estimate
-    
-    # Compute median of TE and TM L_50 values
-    L_50_te = L_50_dict.get("te", 10.0)
-    L_50_tm = L_50_dict.get("tm", 10.0)
-    L_50_median = (L_50_te + L_50_tm) / 2
-    
-    delta_n_te = delta_n_dict.get("te", 0.0)
-    delta_n_tm = delta_n_dict.get("tm", 0.0)
-    
-    # Apply trim factor
-    L_c_raw = L_50_median * (1 + trim_factor)
-    
-    # Clip to safety bounds with warning
-    L_c = float(np.clip(L_c_raw, 3.0, 50.0))
-    if L_c != L_c_raw:
-        print(f"[L_c WARNING] L_c clipped from {L_c_raw:.3f} to {L_c:.3f} µm "
-              f"(weak/strong coupling or out-of-bounds geometry)")
-    
-    # Store in blended cache
-    _coupling_cache_blended[blended_key] = L_c
-    _save_coupling_cache(cache_dir)
-    
-    # Log summary
-    print(f"[L_c derived] Δn_TE={delta_n_te:.6f}, Δn_TM={delta_n_tm:.6f}, "
-          f"L_50_TE={L_50_te:.3f}µm, L_50_TM={L_50_tm:.3f}µm, "
-          f"median={L_50_median:.3f}µm, trim={trim_factor:.1%}, L_c={L_c:.3f}µm")
-    
-    return L_c
-
-
-
-def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="data", blend_policy="median"):
-    """
-    Compute coupling length L_c for asymmetric directional coupler (different arm widths).
-    
-    Args:
-        param: Parameter namespace with either (wg_width_left, wg_width_right) or (wg_width, delta_w),
-               plus coupling_gap, wg_thick, medium.SiN, medium.SiO2.
+        param: Parameter namespace with wg_width, delta_w, coupling_gap, wg_thick, medium.SiN, medium.SiO2.
         lambda0: Wavelength in µm (default: param.wl_0)
         trim_factor: Empirical trim factor for bends/transitions (default: 0.075)
         cache_dir: Directory for cache file (default: "data")
         blend_policy: How to blend TE/TM results: "median" (default), "te", or "tm"
+        length_bounds: Optional tuple (min_len, max_len) to clip L_c; defaults to (3, 50) µm
     
     Returns:
-        L_c in µm (clipped to [3.0, 50.0] µm safety bounds)
+        L_c in µm (clipped to provided safety bounds)
     """
     if _ModeSolver is None:
         raise AttributeError("ModeSolver plugin is unavailable in this tidy3d build")
@@ -254,10 +47,25 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
     lambda0 = float(lambda0)
     
     w1, w2 = _adc__get_w1_w2(param)
+    
+    # Symmetric detection: if widths are nearly equal, log but use same math (Δ→0 naturally)
+    epsilon_w = 0.002  # 2 nm threshold for symmetric detection
+    if abs(w1 - w2) < epsilon_w:
+        print(f"[L_c (ADC)] symmetric detected (|w1-w2|={abs(w1-w2)*1000:.2f}nm < {epsilon_w*1000:.0f}nm)")
     coupling_gap = float(param.coupling_gap)
     wg_thick = float(param.wg_thick)
     eps_SiN = float(param.medium.SiN.permittivity)
     eps_SiO2 = float(param.medium.SiO2.permittivity)
+    
+    # Resolve safety bounds for L_c clipping
+    if length_bounds is None:
+        min_len, max_len = 3.0, 50.0
+    else:
+        if len(length_bounds) != 2:
+            raise ValueError("length_bounds must be a tuple (min_len, max_len)")
+        min_len, max_len = map(float, length_bounds)
+        if min_len <= 0 or max_len <= 0 or min_len >= max_len:
+            raise ValueError("length_bounds must satisfy 0 < min_len < max_len")
     
     pols = ("te", "tm")
     L_50_dict = {}
@@ -277,6 +85,10 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
             Delta = cached["Delta"]
             kappa = cached["kappa"]
             L_50 = cached["L_50"]
+            # Recompute Cmax on cache hit (was not stored in older cache revs)
+            kappa_sq_local = float(kappa) ** 2
+            den_local = kappa_sq_local + float(Delta) ** 2
+            Cmax = (kappa_sq_local / den_local) if den_local > 0 else 0.0
         else:
             # Isolated arms
             n1 = _adc__isolated_neff(w1, param, pol, lambda0)
@@ -289,8 +101,10 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
             
             # Coupled pair simulation
             # Build two waveguides at y positions + and - (gap + widths)/2
-            y_upper = (coupling_gap + w1 + w2) / 2
-            y_lower = -y_upper
+            # Correct center-to-center spacing between waveguides
+            d_center = coupling_gap + 0.5 * (w1 + w2)
+            y_upper = +0.5 * d_center
+            y_lower = -0.5 * d_center
             t = wg_thick
             
             domain_x = 2.0 * max(w1, w2)
@@ -375,6 +189,8 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
                 L_50 = np.inf
                 print(f"[L_c (ADC) WARNING] pol={pol.upper()}: κ={kappa:.4e} ≤ |Δ|={abs(Delta):.4e}, 50:50 coupling not reachable (Cmax={Cmax:.3f})")
             else:
+                # Log reachability info
+                print(f"[L_c (ADC)] pol={pol.upper()}: κ={kappa:.4e} > |Δ|={abs(Delta):.4e}, 50:50 reachable (Cmax={Cmax:.3f})")
                 ratio = 0.5 * (1.0 + (Delta / kappa)**2)
                 ratio = min(max(ratio, 0.0), 1.0)
                 L_50 = (1.0 / Omega) * np.arcsin(np.sqrt(ratio))
@@ -385,15 +201,24 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
                 "beta_split": S,
                 "Delta": Delta,
                 "kappa": kappa,
+                "Cmax": Cmax,
                 "L_50": L_50,
             }
             _save_coupling_cache(cache_dir)
         
+        # Ensure Cmax is defined (covers both cache and fresh-solve paths)
+        if "Cmax" in locals():
+            Cmax_local = Cmax
+        else:
+            kappa_sq_local = float(kappa) ** 2
+            den_local = kappa_sq_local + float(Delta) ** 2
+            Cmax_local = (kappa_sq_local / den_local) if den_local > 0 else 0.0
+
         n1_dict[pol] = n1
         n2_dict[pol] = n2
         Delta_dict[pol] = Delta
         kappa_dict[pol] = kappa
-        Cmax_dict[pol] = Cmax
+        Cmax_dict[pol] = Cmax_local
         L_50_dict[pol] = L_50
     
     # Blend according to policy
@@ -402,8 +227,8 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
         finite_vals = [v for v in L_50_dict.values() if np.isfinite(v)]
         if len(finite_vals) == 0:
             # Both infinite => return upper bound clipped with warning
-            L_c_raw = 50.0
-            print("[L_c (ADC) WARNING] Both TE and TM L_50 are infinite; returning upper bound 50 µm")
+            L_c_raw = max_len
+            print(f"[L_c (ADC) WARNING] Both TE and TM L_50 are infinite; returning upper bound {max_len:.1f} µm")
         elif len(finite_vals) == 1:
             L_c_raw = finite_vals[0]
         else:
@@ -417,12 +242,26 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
     
     # Apply trim factor and clip
     L_c_raw_trimmed = L_c_raw * (1 + trim_factor)
-    L_c = float(np.clip(L_c_raw_trimmed, 3.0, 50.0))
+    L_c = float(np.clip(L_c_raw_trimmed, min_len, max_len))
     if L_c != L_c_raw_trimmed:
-        print(f"[L_c (ADC) WARNING] L_c clipped from {L_c_raw_trimmed:.3f} to {L_c:.3f} µm (out-of-bounds geometry or coupling)")
+        print(f"[L_c (ADC) WARNING] L_c clipped from {L_c_raw_trimmed:.3f} to {L_c:.3f} µm (bounds [{min_len}, {max_len}])")
     
     # Store in blended cache
-    blended_key = (_COUPLING_CACHE_REV, "adc", w1, w2, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, trim_factor, blend_policy)
+    blended_key = (
+        _COUPLING_CACHE_REV,
+        "adc",
+        w1,
+        w2,
+        coupling_gap,
+        wg_thick,
+        lambda0,
+        eps_SiN,
+        eps_SiO2,
+        trim_factor,
+        blend_policy,
+        min_len,
+        max_len,
+    )
     _coupling_cache_blended[blended_key] = L_c
     _save_coupling_cache(cache_dir)
     
@@ -447,21 +286,19 @@ def compute_Lc_asymmetric(param, lambda0=None, trim_factor=0.075, cache_dir="dat
 def _adc__get_w1_w2(param):
     """
     Determine arm widths (w1, w2) for asymmetric directional coupler from param.
-    Priority:
-    1) Use wg_width_left and wg_width_right if present.
-    2) Else use wg_width and delta_w.
-    Raises ValueError if neither available.
+    Uses delta_w approach: w1 = wg_width + delta_w/2, w2 = wg_width - delta_w/2.
+    
+    Raises ValueError if wg_width or delta_w not available.
     """
-    if hasattr(param, 'wg_width_left') and hasattr(param, 'wg_width_right'):
-        w1 = float(param.wg_width_left)
-        w2 = float(param.wg_width_right)
-    elif hasattr(param, 'wg_width') and hasattr(param, 'delta_w'):
-        w_base = float(param.wg_width)
-        delta_w = float(param.delta_w)
-        w1 = w_base + delta_w / 2
-        w2 = w_base - delta_w / 2
-    else:
-        raise ValueError("Asymmetric coupling length computation requires either (wg_width_left, wg_width_right) or (wg_width, delta_w) parameters")
+    if not hasattr(param, 'wg_width'):
+        raise ValueError("Asymmetric coupling length computation requires wg_width parameter")
+    if not hasattr(param, 'delta_w'):
+        raise ValueError("Asymmetric coupling length computation requires delta_w parameter")
+    
+    w_base = float(param.wg_width)
+    delta_w = float(param.delta_w)
+    w1 = w_base + delta_w / 2
+    w2 = w_base - delta_w / 2
     return w1, w2
 
 
@@ -530,43 +367,6 @@ def _adc__isolated_neff(width, param, pol, lambda0):
         n_eff = 1.5  # fallback guess
     
     return n_eff
-
-
-
-def _identify_even_odd_modes(sol, n_eff_arr):
-    """
-    Identify even and odd supermodes from mode solver solution.
-    
-    Returns (n_even, n_odd) where n_even > n_odd typically.
-    Uses field symmetry about mid-plane between waveguides.
-    """
-    if len(n_eff_arr) < 2:
-        raise ValueError("Need at least 2 modes to identify even/odd pair")
-    
-    # Get field components for analysis
-    try:
-        # Try to get Ey or Ez component for symmetry analysis
-        if hasattr(sol, 'Ey'):
-            fields = np.array(sol.Ey)
-        elif hasattr(sol, 'Ez'):
-            fields = np.array(sol.Ez)
-        else:
-            # Fallback: use higher n_eff as even, lower as odd (typical for coupled waveguides)
-            sorted_indices = np.argsort(n_eff_arr)[::-1]  # descending order
-            return float(n_eff_arr[sorted_indices[0]]), float(n_eff_arr[sorted_indices[1]])
-        
-        # Analyze symmetry: even mode has similar field on both sides, odd has opposite
-        # For simplicity, use n_eff ordering (even typically higher n_eff)
-        # In weakly coupled waveguides, even mode has constructive overlap (higher n_eff)
-        sorted_indices = np.argsort(n_eff_arr)[::-1]  # descending order
-        n_even = float(n_eff_arr[sorted_indices[0]])
-        n_odd = float(n_eff_arr[sorted_indices[1]])
-        
-        return n_even, n_odd
-    except Exception:
-        # Fallback to simple n_eff sorting
-        sorted_indices = np.argsort(n_eff_arr)[::-1]
-        return float(n_eff_arr[sorted_indices[0]]), float(n_eff_arr[sorted_indices[1]])
 
 
 def _load_coupling_cache(cache_dir="data"):

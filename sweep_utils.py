@@ -89,15 +89,16 @@ def compute_objective(results_te, results_tm, param, weights):
     }
 
 
-def sweep(grid_gap, grid_width, grid_length, param, weights, run_single_fn, dry_run=False, save_top_k=10, outdir="results",lambda_single=None):
-    """Sweep over (coupling_gap, wg_width) with optional L_c fine-tuning.
+def sweep(grid_gap, grid_width, grid_length, param, weights, run_single_fn, dry_run=False, save_top_k=10, outdir="results",lambda_single=None, grid_delta_w=None):
+    """Sweep over (coupling_gap, wg_width, delta_w) with optional L_c fine-tuning.
     
     Note: coupling_length is now derived from supermode analysis by default.
     If grid_length is provided, it enables fine-tuning sweep around derived values.
-
+    
     Args:
         grid_gap, grid_width: iterables of values in µm
         grid_length: Optional iterable for L_c fine-tuning (None for derived-only)
+        grid_delta_w: Optional iterable for delta_w sweep (None for symmetric only)
         param: parameter namespace object (will be modified during sweep)
         weights: optimization weights dict
         run_single_fn: function to run single simulation (from dc_study.run_single)
@@ -115,13 +116,23 @@ def sweep(grid_gap, grid_width, grid_length, param, weights, run_single_fn, dry_
     else:
         length_values = grid_length
     
-    total_configs = len(grid_gap) * len(grid_width) * len(length_values)
-    print(f"\n[SWEEP] |g|={len(grid_gap)} |w|={len(grid_width)} |L|={len(length_values)} total={total_configs} configurations")
+    # Handle optional grid_delta_w
+    if grid_delta_w is None:
+        delta_w_values = [0.0]  # Default to symmetric
+    else:
+        delta_w_values = grid_delta_w
+    
+    total_configs = len(grid_gap) * len(grid_width) * len(delta_w_values) * len(length_values)
+    print(f"\n[SWEEP] |g|={len(grid_gap)} |w|={len(grid_width)} |δw|={len(delta_w_values)} |L|={len(length_values)} total={total_configs} configurations")
     if grid_length is None:
         print("[SWEEP] L_c will be derived from supermode analysis (not swept)")
     else:
         print(f"[SWEEP] L_c fine-tuning enabled: {len(length_values)} values")
-
+    if grid_delta_w is None:
+        print("[SWEEP] delta_w not swept (symmetric mode only)")
+    else:
+        print(f"[SWEEP] delta_w sweep enabled: {len(delta_w_values)} values")
+    
     # store best few results
     best = []  # list of (Score, row_dict)
     # accumulate cost estimates for dry_run
@@ -131,9 +142,9 @@ def sweep(grid_gap, grid_width, grid_length, param, weights, run_single_fn, dry_
     # Store all rows in sorted order (by Score descending)
     all_rows = []  # list of (Score, row_dict) - sorted descending by Score
     
-    # Define CSV header and column order (removed coupling_length_um, added coupling_trim_factor)
+    # Define CSV header and column order
     csv_header = [
-        "coupling_gap_um", "wg_width_um",
+        "coupling_gap_um", "wg_width_um", "delta_w_um", "wg_width_left_um", "wg_width_right_um", "is_asymmetric",
         "eta_te_1550", "eta_tm_1550", "DeltaEta_1550",
         "Vbar_te", "Vbar_tm", "Vbar_avg", "DeltaEta_avg", "sigma_tol", "Lc", "coupling_trim_factor", "Score"
     ]
@@ -146,96 +157,110 @@ def sweep(grid_gap, grid_width, grid_length, param, weights, run_single_fn, dry_
     # loop
     for g in grid_gap:
         for wwidth in grid_width:
-            # Set geometry parameters
-            setattr(param, "coupling_gap", float(g))
-            setattr(param, "wg_width", float(wwidth))
-            
-            # coupling_length will be computed in update_param_derived()
-            update_param_derived(param)  # Computes derived coupling_length
-            base_Lc = param.coupling_length  # Store for reference
-            
-            # Fine-tuning loop (if enabled)
-            for Lc in length_values:
-                if Lc is not None:
-                    # Override with fine-tuned value
-                    setattr(param, "coupling_length", float(Lc))
-                    update_param_derived(param)  # Recompute size_x with new Lc
-                    Lc_display = Lc
-                else:
-                    # Use derived value (already computed above)
-                    Lc_display = param.coupling_length
+            for delta_w_val in delta_w_values:
+                # Set geometry parameters
+                setattr(param, "coupling_gap", float(g))
+                setattr(param, "wg_width", float(wwidth))
+                setattr(param, "delta_w", float(delta_w_val))
                 
-                print(f"\n[SWEEP] g={g:.3f}µm, w={wwidth:.3f}µm, Lc={Lc_display:.3f}µm")
+                # Validate delta_w bounds
+                if abs(delta_w_val) > 0.3:
+                    print(f"[SWEEP] WARNING: delta_w={delta_w_val:.3f}µm exceeds 0.3µm constraint, skipping")
+                    continue
                 
-                # Build task tag
-                if Lc is not None:
-                    task_tag = f"3d_g{g:.3f}_w{wwidth:.3f}_L{Lc:.3f}"
-                else:
-                    task_tag = f"3d_g{g:.3f}_w{wwidth:.3f}"
+                # coupling_length will be computed in update_param_derived()
+                update_param_derived(param)  # Computes derived coupling_length and w1, w2
+                base_Lc = param.coupling_length  # Store for reference
+                w1 = getattr(param, 'wg_width_left', wwidth)
+                w2 = getattr(param, 'wg_width_right', wwidth)
+                is_asymmetric = abs(delta_w_val) > 1e-6
                 
-                summaries = {}
-                config_cost = 0.0
-                for pol in ("te", "tm"):
-                    s = run_single_fn(param, pol=pol, task_tag=task_tag, dry_run=dry_run, lambda_single=lambda_single)
-                    if s is not None:
-                        summaries[pol] = s
-                        # Accumulate cost if dry_run
-                        if dry_run and "cost_estimate" in s:
-                            cost_val = _extract_cost_value(s["cost_estimate"])
-                            config_cost += cost_val
-                            total_cost += cost_val
-                            cost_count += 1
+                # Fine-tuning loop (if enabled)
+                for Lc in length_values:
+                    if Lc is not None:
+                        # Override with fine-tuned value
+                        setattr(param, "coupling_length", float(Lc))
+                        update_param_derived(param)  # Recompute size_x with new Lc
+                        Lc_display = Lc
+                    else:
+                        # Use derived value (already computed above)
+                        Lc_display = param.coupling_length
+                    
+                    print(f"\n[SWEEP] g={g:.3f}µm, w={wwidth:.3f}µm, δw={delta_w_val:.3f}µm (w1={w1:.3f}µm, w2={w2:.3f}µm), Lc={Lc_display:.3f}µm")
+                    
+                    # Build task tag
+                    if Lc is not None:
+                        task_tag = f"3d_g{g:.3f}_w{wwidth:.3f}_dw{delta_w_val:.3f}_L{Lc:.3f}"
+                    else:
+                        task_tag = f"3d_g{g:.3f}_w{wwidth:.3f}_dw{delta_w_val:.3f}"
+                    
+                    summaries = {}
+                    config_cost = 0.0
+                    for pol in ("te", "tm"):
+                        s = run_single_fn(param, pol=pol, task_tag=task_tag, dry_run=dry_run, lambda_single=lambda_single)
+                        if s is not None:
+                            summaries[pol] = s
+                            # Accumulate cost if dry_run
+                            if dry_run and "cost_estimate" in s:
+                                cost_val = _extract_cost_value(s["cost_estimate"])
+                                config_cost += cost_val
+                                total_cost += cost_val
+                                cost_count += 1
 
-                if dry_run:
-                    if config_cost > 0:
-                        print(f"[SWEEP-3D] Config cost: {config_cost:.3f} FlexCredits (TE + TM)")
-                    continue  # Skip objective computation in dry_run
+                    if dry_run:
+                        if config_cost > 0:
+                            print(f"[SWEEP-3D] Config cost: {config_cost:.3f} FlexCredits (TE + TM)")
+                        continue  # Skip objective computation in dry_run
 
-                if not summaries or ("te" not in summaries) or ("tm" not in summaries):
-                    continue  # skip if failed
+                    if not summaries or ("te" not in summaries) or ("tm" not in summaries):
+                        continue  # skip if failed
 
-                # point metrics (only when not dry_run)
-                obj = compute_objective(summaries["te"], summaries["tm"], param, weights)
-                eta_te_1550 = eta_at_1550_from_summary(summaries["te"]) 
-                eta_tm_1550 = eta_at_1550_from_summary(summaries["tm"]) 
-                d_eta_1550 = abs(eta_te_1550 - eta_tm_1550)
+                    # point metrics (only when not dry_run)
+                    obj = compute_objective(summaries["te"], summaries["tm"], param, weights)
+                    eta_te_1550 = eta_at_1550_from_summary(summaries["te"]) 
+                    eta_tm_1550 = eta_at_1550_from_summary(summaries["tm"]) 
+                    d_eta_1550 = abs(eta_te_1550 - eta_tm_1550)
 
-                row = {
-                    "coupling_gap_um": f"{float(g):.6f}",
-                    "wg_width_um": f"{float(wwidth):.6f}",
-                    "eta_te_1550": f"{eta_te_1550:.6f}",
-                    "eta_tm_1550": f"{eta_tm_1550:.6f}",
-                    "DeltaEta_1550": f"{d_eta_1550:.6f}",
-                    "Vbar_te": f"{obj['Vbar_te']:.6f}",
-                    "Vbar_tm": f"{obj['Vbar_tm']:.6f}",
-                    "Vbar_avg": f"{obj['Vbar_avg']:.6f}",
-                    "DeltaEta_avg": f"{obj['DeltaEta_avg']:.6f}",
-                    "sigma_tol": f"{obj['sigma_tol']:.6f}",
-                    "Lc": f"{obj['Lc']:.6f}",
-                    "coupling_trim_factor": f"{getattr(param, 'coupling_trim_factor', 0.075):.6f}",
-                    "Score": f"{obj['Score']:.6f}",
-                }
+                    row = {
+                        "coupling_gap_um": f"{float(g):.6f}",
+                        "wg_width_um": f"{float(wwidth):.6f}",
+                        "delta_w_um": f"{float(delta_w_val):.6f}",
+                        "wg_width_left_um": f"{float(w1):.6f}",
+                        "wg_width_right_um": f"{float(w2):.6f}",
+                        "is_asymmetric": "1" if is_asymmetric else "0",
+                        "eta_te_1550": f"{eta_te_1550:.6f}",
+                        "eta_tm_1550": f"{eta_tm_1550:.6f}",
+                        "DeltaEta_1550": f"{d_eta_1550:.6f}",
+                        "Vbar_te": f"{obj['Vbar_te']:.6f}",
+                        "Vbar_tm": f"{obj['Vbar_tm']:.6f}",
+                        "Vbar_avg": f"{obj['Vbar_avg']:.6f}",
+                        "DeltaEta_avg": f"{obj['DeltaEta_avg']:.6f}",
+                        "sigma_tol": f"{obj['sigma_tol']:.6f}",
+                        "Lc": f"{obj['Lc']:.6f}",
+                        "coupling_trim_factor": f"{getattr(param, 'coupling_trim_factor', 0.075):.6f}",
+                        "Score": f"{obj['Score']:.6f}",
+                    }
 
-                # Insert row into sorted list (descending by Score)
-                score_val = obj["Score"]
-                # Use bisect to find insertion point for descending order
-                # Since we want descending, we insert at position based on negative score
-                insert_idx = bisect.bisect_left([-s for s, _ in all_rows], -score_val)
-                all_rows.insert(insert_idx, (score_val, row))
-                
-                # Rewrite entire CSV file with sorted rows
-                with csv_path.open("w", newline="") as f:
-                    w = csv.writer(f)
-                    w.writerow(csv_header)
-                    for _, r in all_rows:
-                        # Write row in column order matching header
-                        w.writerow([r[col] for col in csv_header])
+                    # Insert row into sorted list (descending by Score)
+                    score_val = obj["Score"]
+                    # Use bisect to find insertion point for descending order
+                    # Since we want descending, we insert at position based on negative score
+                    insert_idx = bisect.bisect_left([-s for s, _ in all_rows], -score_val)
+                    all_rows.insert(insert_idx, (score_val, row))
+                    
+                    # Rewrite entire CSV file with sorted rows
+                    with csv_path.open("w", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(csv_header)
+                        for _, r in all_rows:
+                            # Write row in column order matching header
+                            w.writerow([r[col] for col in csv_header])
 
-                # maintain top-k
-                best.append((obj["Score"], row))
-                best.sort(key=lambda t: t[0], reverse=True)
-                if len(best) > save_top_k:
-                    best.pop()
+                    # maintain top-k
+                    best.append((obj["Score"], row))
+                    best.sort(key=lambda t: t[0], reverse=True)
+                    if len(best) > save_top_k:
+                        best.pop()
 
     # print cost summary for dry_run
     if dry_run and cost_count > 0:
@@ -253,6 +278,6 @@ def sweep(grid_gap, grid_width, grid_length, param, weights, run_single_fn, dry_
     if best:
         print("\n[SWEEP-3D] Top candidates (by Score):")
         for rank, (score, row) in enumerate(best, 1):
-            print(f"  #{rank:02d} Score={float(score):.4f}  g={row['coupling_gap_um']} µm  w={row['wg_width_um']} µm  Lc={row['coupling_length_um']} µm  Vbar_avg={row['Vbar_avg']}  Δη_avg={row['DeltaEta_avg']}  Δη@1550={row['DeltaEta_1550']}")
+            print(f"  #{rank:02d} Score={float(score):.4f}  g={row['coupling_gap_um']} µm  w={row['wg_width_um']} µm  δw={row['delta_w_um']} µm  Lc={row['Lc']} µm  Vbar_avg={row['Vbar_avg']}  Δη_avg={row['DeltaEta_avg']}  Δη@1550={row['DeltaEta_1550']}")
         print(f"[SWEEP-3D] saved CSV: {csv_path}")
 
