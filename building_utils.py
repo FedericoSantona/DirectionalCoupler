@@ -89,13 +89,28 @@ def update_param_derived(p, lambda_eval=None):
     
     # Step 2: Check if geometry parameters changed (force recomputation if they did)
     # Include w1, w2 in geometry signature
-    current_geometry = (
-        w1, w2,
-        float(getattr(p, 'coupling_gap', 0)),
-        float(getattr(p, 'wg_thick', 0)),
-        float(getattr(p.medium.SiN, 'permittivity', 1.0)),
-        float(getattr(p.medium.SiO2, 'permittivity', 1.0)),
-    )
+    # For dispersive materials, include wavelength in signature if freeze_l_c=False
+    use_dispersive = getattr(p.medium, 'use_dispersive', False)
+    if use_dispersive and not freeze:
+        # When using dispersive materials and not freezing L_c, wavelength affects permittivity
+        # So include wavelength in geometry signature
+        current_geometry = (
+            w1, w2,
+            float(getattr(p, 'coupling_gap', 0)),
+            float(getattr(p, 'wg_thick', 0)),
+            lambda0,  # Include wavelength for dispersive materials
+            "dispersive",  # Dispersion model identifier
+        )
+    else:
+        # For constant materials or when freeze_l_c=True, use permittivity values
+        # (wavelength doesn't affect geometry signature in these cases)
+        current_geometry = (
+            w1, w2,
+            float(getattr(p, 'coupling_gap', 0)),
+            float(getattr(p, 'wg_thick', 0)),
+            float(getattr(p.medium.SiN, 'permittivity', 1.0)),
+            float(getattr(p.medium.SiO2, 'permittivity', 1.0)),
+        )
     
     # Get stored geometry from last computation
     last_geometry = getattr(p, '_last_geometry_for_lc', None)

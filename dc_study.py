@@ -10,6 +10,7 @@ from simulation_utils import (
     summarize_and_save,
     plot_eta_overlay,
     plot_visibility_overlay,
+    plot_delta_phi_overlay,
     save_combined_te_tm_csv,
     compute_and_save_band_averaged_visibility,
     plot_delta_eta,
@@ -20,6 +21,7 @@ from simulation_utils import (
 from building_utils import generate_object, update_param_derived
 from sweep_utils import sweep
 import matplotlib.pyplot as plt
+from material_dispersion import get_permittivity_SiO2, get_permittivity_SiN
 # import need be changed in some cases
 
 
@@ -64,7 +66,7 @@ MONITOR_LAMBDA_START = 1.530 #nm
 MONITOR_LAMBDA_STOP = 1.565 #nm
 MONITOR_LAMBDA_POINTS = 36  # Adjust as needed to trade spectral resolution for speed
 Y_PAD_EXTRA = 0.2  # µm additional y-padding to ensure ≥ λ0/2 clearance to PML
-ENABLE_FIELD_MONITOR = False  # set False to disable costly field monitor
+ENABLE_FIELD_MONITOR = True # set False to disable costly field monitor
 
 # ---- multi-objective weights (Stage 1 defaults) ----
 # Score = Vbar_avg - alpha*DeltaEta_avg - beta*sigma_tol - gamma*(L_c/L_ref)
@@ -85,16 +87,20 @@ FREEZE_L_C = True  # If True (default), compute L_c once at design wavelength an
 COUPLING_BLEND_POLICY = "balance"  # How to blend TE/TM L50: "median" (default), "te", "tm", or "balance"
                                     # "balance" optimizes L_c to minimize |η_TE-0.5|+|η_TM-0.5|
 
+# --- Material dispersion configuration ---
+USE_DISPERSIVE_MATERIALS = True  # If True, use wavelength-dependent refractive indices (Sellmeier)
+                                  # If False, use constant values (backward compatibility)
+
 #script parameters, input parameters for the simulation
 # Note: coupling_length will be derived from supermode analysis in update_param_derived()
 sbend_length = 8  #µm
 sbend_height = 0.5  #µm
 wg_length = 5  #µm
-wg_width = 1.15  #µm
+wg_width = 1.10  #µm
 wg_thick = 0.32  #µm
 wl_0 = 1.55  #µm
 coupling_gap = 0.265  #µm
-delta_w = 0.055  #µm , Asymmetric width difference: w1 = wg_width + delta_w/2, w2 = wg_width - delta_w/2
+delta_w = -0.06  #µm , Asymmetric width difference: w1 = wg_width + delta_w/2, w2 = wg_width - delta_w/2
                # Default 0.0 for symmetric mode. Bounds: |delta_w| ≤ 0.3 µm (fabrication constraint)
 
 #calculate the size of the simulation domain (coupling_length will be computed later)
@@ -103,14 +109,52 @@ size_z = 3*wl_0+wg_thick
 freq_0 = td.C_0/wl_0
 size_y = 2*(sbend_height + wl_0) + wg_width + coupling_gap + max(0.0, wg_width - wl_0) + Y_PAD_EXTRA
 
-#Everything not occupied by a structure uses this medium
-SiO2 = td.Medium(
-    name = 'SiO2', 
-    permittivity = 2.085136, 
-)
+# Material definitions with wavelength-dependent support
+def create_SiO2_medium(lambda_um=None):
+    """
+    Create SiO2 medium with wavelength-dependent permittivity if enabled.
+    
+    Args:
+        lambda_um: Wavelength in micrometers. If None and USE_DISPERSIVE_MATERIALS=True,
+                   uses wl_0 (1.55 µm). If USE_DISPERSIVE_MATERIALS=False, uses constant value.
+    
+    Returns:
+        td.Medium object
+    """
+    if USE_DISPERSIVE_MATERIALS:
+        if lambda_um is None:
+            lambda_um = wl_0
+        permittivity = get_permittivity_SiO2(lambda_um)
+    else:
+        # Constant value at 1550nm: n ≈ 1.444, ε ≈ 2.085136
+        permittivity = 2.085136
+    return td.Medium(name='SiO2', permittivity=permittivity)
 
-# Waveguide material: SiN instead of Si (n≈2.0)
-SiN = td.Medium(name='SiN', permittivity=2.0**2)
+
+def create_SiN_medium(lambda_um=None):
+    """
+    Create SiN medium with wavelength-dependent permittivity if enabled.
+    
+    Args:
+        lambda_um: Wavelength in micrometers. If None and USE_DISPERSIVE_MATERIALS=True,
+                   uses wl_0 (1.55 µm). If USE_DISPERSIVE_MATERIALS=False, uses constant value.
+    
+    Returns:
+        td.Medium object
+    """
+    if USE_DISPERSIVE_MATERIALS:
+        if lambda_um is None:
+            lambda_um = wl_0
+        permittivity = get_permittivity_SiN(lambda_um)
+    else:
+        # Constant value: n = 2.0, ε = 4.0
+        permittivity = 2.0**2
+    return td.Medium(name='SiN', permittivity=permittivity)
+
+
+# Create initial materials at design wavelength
+SiO2 = create_SiO2_medium(wl_0)
+SiN = create_SiN_medium(wl_0)
 
 # Mode specs (realistic neff guesses for SiN platform)
 MODE_SPEC_TE = td.ModeSpec(num_modes=1, filter_pol='te', target_neff=1.7)
@@ -138,8 +182,11 @@ if abs(delta_w) > 0.3:
 param.pad_extra = Y_PAD_EXTRA
 param.medium = SimpleNamespace(
     Vacuum=td.Medium(permittivity=1.0),
-    SiO2=SiO2,
-    SiN=SiN
+    SiO2=SiO2,  # Initial medium at design wavelength
+    SiN=SiN,    # Initial medium at design wavelength
+    create_SiO2=create_SiO2_medium,  # Factory function for wavelength-dependent SiO2
+    create_SiN=create_SiN_medium,    # Factory function for wavelength-dependent SiN
+    use_dispersive=USE_DISPERSIVE_MATERIALS  # Flag for dispersion mode
 )
 param.mode_specs = {
     "te": MODE_SPEC_TE,
@@ -249,7 +296,7 @@ def run_single(param, pol='te', task_tag='single', dry_run=False, lambda_single=
             data = res.results()
         except AttributeError:
             data = res
-        return summarize_and_save(data, pol, outdir=str(RESULTS_DIR), mode_solver_diag=mode_solver_diag)
+        return summarize_and_save(data, pol, outdir=str(RESULTS_DIR), mode_solver_diag=mode_solver_diag, param=param)
     finally:
          # --- RESTORE monitor settings no matter what ---
         (
@@ -333,6 +380,7 @@ if __name__ == "__main__":
             # Overlay plots for coupling ratio and visibility
             plot_eta_overlay(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))
             plot_visibility_overlay(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))
+            plot_delta_phi_overlay(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))
 
             # Combine TE/TM spectra into a single CSV
             delta_eta = save_combined_te_tm_csv(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))

@@ -12,7 +12,7 @@ try:
 except ImportError:
     _HAS_SCIPY = False
 
-_COUPLING_CACHE_REV = 2
+_COUPLING_CACHE_REV = 3  # Bumped to invalidate old constant-permittivity cache
 
 # Cache for coupling length computations
 _coupling_cache_per_pol = {}  # Level 1: per-polarization supermode data
@@ -45,6 +45,49 @@ def _eta_from_cmt(kappa, Delta, Omega, L):
     sin_sq = np.sin(Omega_L) ** 2
     eta = Cmax * sin_sq
     return float(np.clip(eta, 0.0, 1.0))
+
+
+def compute_internal_phase(kappa, Delta, Omega, L_c):
+    """
+    Compute internal phase Δφ = arg(a₂/a₁) from CMT parameters.
+    
+    Formula: Δφ = arg(-jκ sin(ΩL_c) / (Ω cos(ΩL_c) - jΔ sin(ΩL_c)))
+    
+    For a canonical 3-dB coupler, Δφ ≈ π/2 at the design wavelength.
+    
+    Args:
+        kappa: Coupling coefficient κ
+        Delta: Detuning parameter Δ
+        Omega: Rabi frequency Ω = sqrt(κ²+Δ²)
+        L_c: Coupling length in µm
+    
+    Returns:
+        Internal phase Δφ in radians
+    """
+    kappa = float(kappa)
+    Delta = float(Delta)
+    Omega = float(Omega)
+    L_c = float(L_c)
+    
+    Omega_L = Omega * L_c
+    sin_Omega_L = np.sin(Omega_L)
+    cos_Omega_L = np.cos(Omega_L)
+    
+    # Numerator: -jκ sin(ΩL_c)
+    numerator = -1j * kappa * sin_Omega_L
+    
+    # Denominator: Ω cos(ΩL_c) - jΔ sin(ΩL_c)
+    denominator = Omega * cos_Omega_L - 1j * Delta * sin_Omega_L
+    
+    # Avoid division by zero
+    if abs(denominator) < 1e-18:
+        return np.nan
+    
+    # Compute ratio and extract phase
+    ratio = numerator / denominator
+    delta_phi = np.angle(ratio)
+    
+    return float(delta_phi)
 
 
 def _optimize_Lc_balance(kappa_dict, Delta_dict, Omega_dict, min_len, max_len):
@@ -169,8 +212,19 @@ def compute_Lc(
         print(f"[L_c (ADC)] symmetric detected (|w1-w2|={abs(w1-w2)*1000:.2f}nm < {epsilon_w*1000:.0f}nm)")
     coupling_gap = float(param.coupling_gap)
     wg_thick = float(param.wg_thick)
-    eps_SiN = float(param.medium.SiN.permittivity)
-    eps_SiO2 = float(param.medium.SiO2.permittivity)
+    
+    # Get wavelength-dependent permittivity if dispersive materials are enabled
+    use_dispersive = getattr(param.medium, 'use_dispersive', False)
+    if use_dispersive and hasattr(param.medium, 'create_SiN'):
+        # Use wavelength-dependent materials
+        medium_SiN = param.medium.create_SiN(lambda_um=lambda0)
+        medium_SiO2 = param.medium.create_SiO2(lambda_um=lambda0)
+        eps_SiN = float(medium_SiN.permittivity)
+        eps_SiO2 = float(medium_SiO2.permittivity)
+    else:
+        # Fallback to constant permittivity (backward compatibility)
+        eps_SiN = float(param.medium.SiN.permittivity)
+        eps_SiO2 = float(param.medium.SiO2.permittivity)
     
     # Resolve safety bounds for L_c clipping
     if length_bounds is None:
@@ -191,8 +245,12 @@ def compute_Lc(
     n1_dict = {}
     n2_dict = {}
     
+    # Include dispersion model identifier in cache key
+    use_dispersive = getattr(param.medium, 'use_dispersive', False)
+    dispersion_id = "dispersive" if use_dispersive else "constant"
+    
     for pol in pols:
-        per_pol_key = (_COUPLING_CACHE_REV, "adc", w1, w2, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, pol)
+        per_pol_key = (_COUPLING_CACHE_REV, "adc", w1, w2, coupling_gap, wg_thick, lambda0, eps_SiN, eps_SiO2, dispersion_id, pol)
         if per_pol_key in _coupling_cache_per_pol:
             cached = _coupling_cache_per_pol[per_pol_key]
             n1 = cached["n1"]
@@ -230,20 +288,29 @@ def compute_Lc(
             domain_y = (coupling_gap + w1 + w2) + 2.0 * pad_y
             domain_z = t + 2.0 * pad_z
             
+            # Use wavelength-specific materials if dispersive mode is enabled
+            use_dispersive = getattr(param.medium, 'use_dispersive', False)
+            if use_dispersive and hasattr(param.medium, 'create_SiN'):
+                medium_SiN_lambda = param.medium.create_SiN(lambda_um=lambda0)
+                medium_SiO2_lambda = param.medium.create_SiO2(lambda_um=lambda0)
+            else:
+                medium_SiN_lambda = param.medium.SiN
+                medium_SiO2_lambda = param.medium.SiO2
+            
             upper_wg = td.Structure(
                 geometry=td.Box(size=(w1, w1, t), center=(0, y_upper, 0)),
-                medium=param.medium.SiN,
+                medium=medium_SiN_lambda,
                 name="upper_wg"
             )
             lower_wg = td.Structure(
                 geometry=td.Box(size=(w2, w2, t), center=(0, y_lower, 0)),
-                medium=param.medium.SiN,
+                medium=medium_SiN_lambda,
                 name="lower_wg"
             )
             
             sim_cross = td.Simulation(
                 size=(domain_x, domain_y, domain_z),
-                medium=param.medium.SiO2,
+                medium=medium_SiO2_lambda,
                 structures=[upper_wg, lower_wg],
                 grid_spec=td.GridSpec(
                     grid_x=td.AutoGrid(min_steps_per_wvl=6),
@@ -387,7 +454,9 @@ def compute_Lc(
     if L_c != L_c_raw_trimmed:
         print(f"[L_c (ADC) WARNING] L_c clipped from {L_c_raw_trimmed:.3f} to {L_c:.3f} µm (bounds [{min_len}, {max_len}])")
     
-    # Store in blended cache
+    # Store in blended cache (include dispersion model identifier)
+    use_dispersive = getattr(param.medium, 'use_dispersive', False)
+    dispersion_id = "dispersive" if use_dispersive else "constant"
     blended_key = (
         _COUPLING_CACHE_REV,
         "adc",
@@ -398,6 +467,7 @@ def compute_Lc(
         lambda0,
         eps_SiN,
         eps_SiO2,
+        dispersion_id,
         trim_factor,
         blend_policy,
         min_len,
@@ -419,6 +489,24 @@ def compute_Lc(
         cmax_str = f"{Cmax:.3f}" if Cmax >= 0 else "N/A"
         summary_parts.append(f"pol={pol.upper()}: n1={n1:.4f}, n2={n2:.4f}, Δ={Delta:.4e}, κ={kappa:.4e}, Cmax={cmax_str}, L50={L50_str}")
     print(f"[L_c (ADC) derived] {'; '.join(summary_parts)}; policy={blend_policy}, trim={trim_factor:.1%}, L_c={L_c:.3f}µm")
+    
+    # Store CMT parameters in param namespace for later use (e.g., Δφ computation)
+    param.cmt_params = {
+        "te": {
+            "kappa": kappa_dict.get("te"),
+            "Delta": Delta_dict.get("te"),
+            "Omega": Omega_dict.get("te"),
+            "L_c": L_c,
+            "lambda0": lambda0,
+        },
+        "tm": {
+            "kappa": kappa_dict.get("tm"),
+            "Delta": Delta_dict.get("tm"),
+            "Omega": Omega_dict.get("tm"),
+            "L_c": L_c,
+            "lambda0": lambda0,
+        }
+    }
     
     return L_c
 
@@ -449,8 +537,15 @@ def _adc__isolated_neff(width, param, pol, lambda0):
     Single waveguide in SiO2 cladding.
     """
     wg_thick = float(param.wg_thick)
-    eps_SiN = param.medium.SiN
-    eps_SiO2 = param.medium.SiO2
+    
+    # Use wavelength-specific materials if dispersive mode is enabled
+    use_dispersive = getattr(param.medium, 'use_dispersive', False)
+    if use_dispersive and hasattr(param.medium, 'create_SiN'):
+        eps_SiN = param.medium.create_SiN(lambda_um=lambda0)
+        eps_SiO2 = param.medium.create_SiO2(lambda_um=lambda0)
+    else:
+        eps_SiN = param.medium.SiN
+        eps_SiO2 = param.medium.SiO2
     
     # Domain size chosen to ensure decay before PML
     pad_y = max(1.0 * lambda0, 2.0 * width)

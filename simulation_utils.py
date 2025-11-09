@@ -305,6 +305,14 @@ def build_sim(param, pol='te'):
     else:
         print("Field monitor disabled")
 
+    # Use wavelength-specific materials if dispersive mode is enabled
+    # Use design wavelength (param.wl_0) for simulation medium since grid_spec uses this wavelength
+    use_dispersive = getattr(param.medium, 'use_dispersive', False)
+    if use_dispersive and hasattr(param.medium, 'create_SiO2'):
+        sim_medium = param.medium.create_SiO2(lambda_um=param.wl_0)
+    else:
+        sim_medium = param.medium.SiO2
+
     sim = td.Simulation(
         size=[param.size_x, param.size_y, param.size_z],
         symmetry=[0, 0, 1],
@@ -318,7 +326,7 @@ def build_sim(param, pol='te'):
         subpixel=td.SubpixelSpec(pec=td.PECConformal()),
         run_time=runtime,
         shutoff=shutoff,
-        medium=param.medium.SiO2,
+        medium=sim_medium,
         sources=[src],
         monitors=monitors,
         structures=structures
@@ -403,20 +411,56 @@ def _lambda_from_monitor(sim_data, pol):
     # Ensure at least 1D array (handle single-point case)
     return np.atleast_1d(lam)
 
-def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None):
+def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None, param=None):
     """
     Extract eta(λ) and V(λ) for a polarization, print clear summary,
     save CSV and per-pol plots to disk. Returns a dict of key metrics.
+    
+    Args:
+        sim_data: Simulation results data
+        pol: Polarization ('te' or 'tm')
+        outdir: Output directory for CSV and plots
+        mode_solver_diag: Optional mode solver diagnostics dict
+        param: Optional parameter namespace (needed for Δφ computation)
     """
     Path(outdir).mkdir(parents=True, exist_ok=True)
     lam = _lambda_from_monitor(sim_data, pol)
     eta = extract_eta(sim_data, pol)
     V = np.atleast_1d(hom_visibility(eta))
 
+    # Compute Δφ(λ) from CMT parameters if available
+    # Import here to avoid circular dependency with coupling_length.py
+    delta_phi = None
+    if param is not None and hasattr(param, 'cmt_params') and param.cmt_params is not None:
+        from coupling_length import compute_internal_phase
+        pol_key = pol.lower()
+        cmt_data = param.cmt_params.get(pol_key)
+        if cmt_data is not None:
+            kappa = cmt_data.get("kappa")
+            Delta = cmt_data.get("Delta")
+            Omega = cmt_data.get("Omega")
+            L_c = cmt_data.get("L_c")
+            
+            if all(v is not None for v in [kappa, Delta, Omega, L_c]):
+                # For now, use fixed CMT parameters at design wavelength
+                # (assuming freeze_l_c=True, so L_c and CMT params are fixed)
+                # Compute Δφ for all wavelengths using fixed parameters
+                delta_phi = np.array([
+                    compute_internal_phase(kappa, Delta, Omega, L_c)
+                    for _ in lam
+                ])
+            else:
+                delta_phi = np.full_like(lam, np.nan)
+        else:
+            delta_phi = np.full_like(lam, np.nan)
+    else:
+        delta_phi = np.full_like(lam, np.nan)
+
     # pick 1550 nm index
     k = int(np.argmin(np.abs(lam - 1.55)))
     eta_1550 = float(eta[k])
     V_1550 = float(V[k])
+    delta_phi_1550 = float(delta_phi[k]) if delta_phi is not None and not np.isnan(delta_phi[k]) else np.nan
 
     # band stats over C-band grid used in the sim (assumed 1.50–1.60 µm)
     dev_from_50 = np.abs(eta - 0.5)
@@ -430,6 +474,9 @@ def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None):
     print(f"\n[{pol.upper()}] SUMMARY")
     print(f"  η(1550 nm)     : {eta_1550:.3f}")
     print(f"  V(1550 nm)     : {V_1550:.3f}")
+    if delta_phi is not None and not np.isnan(delta_phi_1550):
+        delta_phi_deg = np.degrees(delta_phi_1550)
+        print(f"  Δφ(1550 nm)    : {delta_phi_1550:.4f} rad ({delta_phi_deg:.2f}°)")
     print(f"  max |η-0.5|    : {max_dev:.3f}  (over {lam[0]:.3f}–{lam[-1]:.3f} µm)")
     print(f"  min V(λ)       : {min_V:.3f}")
     if mode_solver_diag:
@@ -452,8 +499,12 @@ def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None):
 
     # ---- save CSV ----
     csv_path = Path(outdir) / f"spectra_{pol}.csv"
-    np.savetxt(csv_path, np.c_[lam, eta, V], delimiter=",",
-               header="lambda_um,eta,V", comments="")
+    if delta_phi is not None:
+        np.savetxt(csv_path, np.c_[lam, eta, V, delta_phi], delimiter=",",
+                   header="lambda_um,eta,V,delta_phi", comments="")
+    else:
+        np.savetxt(csv_path, np.c_[lam, eta, V], delimiter=",",
+                   header="lambda_um,eta,V", comments="")
     print(f"  saved CSV      : {csv_path}")
 
     # Individual plots are no longer generated - only combined TE/TM plots are created
@@ -461,7 +512,9 @@ def summarize_and_save(sim_data, pol, outdir="results", mode_solver_diag=None):
 
     return {
         "lam": lam, "eta": eta, "V": V,
+        "delta_phi": delta_phi if delta_phi is not None else np.full_like(lam, np.nan),
         "eta_1550": eta_1550, "V_1550": V_1550,
+        "delta_phi_1550": delta_phi_1550 if delta_phi is not None else np.nan,
         "max_dev": max_dev, "min_V": min_V,
         "csv": str(csv_path),
         "field_fx": field_fx, "field_fy": field_fy,
@@ -491,6 +544,44 @@ def plot_eta_overlay(results_te, results_tm, outdir="results"):
     plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
     print(f"\n[OVERLAY] saved plot: {out}")
 
+def plot_delta_phi_overlay(results_te, results_tm, outdir="results"):
+    """Overlay |Δφ_TE(λ)| and |Δφ_TM(λ)| for quick polarization comparison."""
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+    lam = results_te["lam"]
+    
+    delta_phi_te = results_te.get("delta_phi", np.full_like(lam, np.nan))
+    delta_phi_tm = results_tm.get("delta_phi", np.full_like(lam, np.nan))
+    
+    # Take absolute value (magnitude) of phase
+    abs_delta_phi_te = np.abs(delta_phi_te)
+    abs_delta_phi_tm = np.abs(delta_phi_tm)
+    
+    # Filter out NaN values for plotting
+    valid_te = ~np.isnan(abs_delta_phi_te)
+    valid_tm = ~np.isnan(abs_delta_phi_tm)
+    
+    plt.figure(figsize=(8, 5))
+    if np.any(valid_te):
+        plt.plot(lam[valid_te], abs_delta_phi_te[valid_te], label="TE", linewidth=2)
+    if np.any(valid_tm):
+        plt.plot(lam[valid_tm], abs_delta_phi_tm[valid_tm], label="TM", linewidth=2)
+    
+    # Add target line at π/2 (magnitude target)
+    plt.axhline(np.pi/2, color='k', linestyle='--', linewidth=1.5, label=r'Target: $|\Delta\phi| = \pi/2$')
+    
+    plt.xlabel(r"Wavelength $\lambda$ (µm)", fontsize=12)
+    plt.ylabel(r"Internal Phase Magnitude $|\Delta\phi|$ (rad)", fontsize=12)
+    plt.title(r"Internal Phase Magnitude $|\Delta\phi| = |\arg(a_2/a_1)|$ vs Wavelength", fontsize=13)
+    plt.legend(loc='best', fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    plot_path = Path(outdir) / "delta_phi_vs_lambda_TE_TM.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[PLOT |Δφ|] Saved -> {plot_path}")
+
+
 def plot_visibility_overlay(results_te, results_tm, outdir="results"):
     """Overlay V_TE(λ) and V_TM(λ) for quick polarization comparison."""
     Path(outdir).mkdir(parents=True, exist_ok=True)
@@ -508,7 +599,7 @@ def plot_visibility_overlay(results_te, results_tm, outdir="results"):
 
 def save_combined_te_tm_csv(results_te, results_tm, outdir="results"):
     """
-    Combine TE/TM spectra into a single CSV: lambda_um, eta_TE, eta_TM, delta_eta, V_TE, V_TM.
+    Combine TE/TM spectra into a single CSV: lambda_um, eta_TE, eta_TM, delta_eta, V_TE, V_TM, delta_phi_TE, delta_phi_TM, delta_delta_phi.
     Returns delta_eta array for use in other functions.
     """
     Path(outdir).mkdir(parents=True, exist_ok=True)
@@ -517,8 +608,16 @@ def save_combined_te_tm_csv(results_te, results_tm, outdir="results"):
         raise ValueError("TE and TM wavelength grids do not match; cannot create combined CSV.")
 
     delta_eta = np.abs(results_te["eta"] - results_tm["eta"])  # Δη(λ)
-    combined = np.c_[lam, results_te["eta"], results_tm["eta"], delta_eta, results_te["V"], results_tm["V"]]
-    header = "lambda_um,eta_TE,eta_TM,delta_eta,V_TE,V_TM"
+    
+    # Get delta_phi arrays (handle missing data)
+    delta_phi_te = results_te.get("delta_phi", np.full_like(lam, np.nan))
+    delta_phi_tm = results_tm.get("delta_phi", np.full_like(lam, np.nan))
+    delta_delta_phi = np.abs(delta_phi_te - delta_phi_tm)  # |Δφ_TE - Δφ_TM|
+    
+    combined = np.c_[lam, results_te["eta"], results_tm["eta"], delta_eta, 
+                     results_te["V"], results_tm["V"], 
+                     delta_phi_te, delta_phi_tm, delta_delta_phi]
+    header = "lambda_um,eta_TE,eta_TM,delta_eta,V_TE,V_TM,delta_phi_TE,delta_phi_TM,delta_delta_phi"
     csv_path = Path(outdir) / "combined_TE_TM.csv"
     np.savetxt(csv_path, combined, delimiter=",", header=header, comments="")
     print("[COMBINE] saved combined TE/TM CSV -> " + str(csv_path))

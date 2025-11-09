@@ -1,3 +1,3 @@
-Vbar_TE=0.993819
-Vbar_TM=0.987640
-Vbar_avg=0.990730
+Vbar_TE=0.894720
+Vbar_TM=0.991932
+Vbar_avg=0.943326
