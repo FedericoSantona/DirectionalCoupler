@@ -112,6 +112,7 @@ def update_param_derived(p, lambda_eval=None):
             lambda0=lambda0,
             trim_factor=getattr(p, 'coupling_trim_factor', 0.075),
             cache_dir="data",
+            blend_policy=getattr(p, 'coupling_blend_policy', 'median'),
             length_bounds=getattr(p, 'coupling_length_bounds', None),
         )
         p._last_geometry_for_lc = current_geometry  # Store/update geometry signature
@@ -307,9 +308,10 @@ def make_monitors(param, pol='te'):
     w_max = max(w1, w2)  # Use wider arm for sizing
     centers = _centerline_offsets(param)
     
+    # Use a single, polarization-filtered mode to avoid branch swaps on older Tidy3D versions
     monitor_mode_spec = td.ModeSpec(
-        num_modes=3,
-        filter_pol=None,
+        num_modes=10,
+        filter_pol=pol_key,
         target_neff=getattr(mode_spec, "target_neff", None),
     )
     lam_start = param.monitor_lambda_start
@@ -325,7 +327,7 @@ def make_monitors(param, pol='te'):
         size=[0, 4 * w_max, 5 * param.wg_thick],  # Size to capture mode area of wider arm
         freqs=freqs,
         apodization=td.ApodizationSpec(width=apod_width),
-        mode_spec=monitor_mode_spec
+        mode_spec=monitor_mode_spec,
     )
     # Cross monitor: center on lower arm centerline using w2
     mon_cross = td.ModeMonitor(
@@ -335,7 +337,7 @@ def make_monitors(param, pol='te'):
         size=[0, 4 * w_max, 5 * param.wg_thick],  # Size to capture mode area of wider arm
         freqs=freqs,
         apodization=td.ApodizationSpec(width=apod_width),
-        mode_spec=monitor_mode_spec
+        mode_spec=monitor_mode_spec,
     )
     field_xy = td.FieldMonitor(
         name=f"field_xy_{pol_key}",

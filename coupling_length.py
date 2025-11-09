@@ -5,11 +5,125 @@ from building_utils import resolve_mode_spec
 from pathlib import Path
 import pickle
 
+# Try to import scipy.optimize for balance policy optimization
+try:
+    from scipy.optimize import minimize_scalar
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
 _COUPLING_CACHE_REV = 2
 
 # Cache for coupling length computations
 _coupling_cache_per_pol = {}  # Level 1: per-polarization supermode data
 _coupling_cache_blended = {}  # Level 2: blended L_c values
+
+
+def _eta_from_cmt(kappa, Delta, Omega, L):
+    """
+    Compute coupling ratio η(L) from CMT parameters.
+    
+    Formula: η(L) = Cmax * sin²(Ω*L)
+    where Cmax = κ²/(κ²+Δ²) and Ω = sqrt(κ²+Δ²)
+    
+    Args:
+        kappa: Coupling coefficient κ
+        Delta: Detuning parameter Δ
+        Omega: Rabi frequency Ω = sqrt(κ²+Δ²)
+        L: Coupling length in µm
+    
+    Returns:
+        Coupling ratio η(L) in [0, Cmax]
+    """
+    kappa_sq = float(kappa) ** 2
+    Delta_sq = float(Delta) ** 2
+    den = kappa_sq + Delta_sq
+    if den <= 0:
+        return 0.0
+    Cmax = kappa_sq / den
+    Omega_L = float(Omega) * float(L)
+    sin_sq = np.sin(Omega_L) ** 2
+    eta = Cmax * sin_sq
+    return float(np.clip(eta, 0.0, 1.0))
+
+
+def _optimize_Lc_balance(kappa_dict, Delta_dict, Omega_dict, min_len, max_len):
+    """
+    Optimize L_c to minimize |η_TE(L) - 0.5| + |η_TM(L) - 0.5|.
+    
+    Uses CMT predictions from supermode (κ, Δ) parameters.
+    Constrains search to first few lobes to prefer shortest workable L.
+    
+    Args:
+        kappa_dict: Dict with 'te' and 'tm' keys containing κ values
+        Delta_dict: Dict with 'te' and 'tm' keys containing Δ values
+        Omega_dict: Dict with 'te' and 'tm' keys containing Ω values
+        min_len: Minimum coupling length bound in µm (safety limit)
+        max_len: Maximum coupling length bound in µm (safety limit)
+    
+    Returns:
+        Optimal L_c in µm, or None if optimization fails
+    """
+    # Check that we have valid parameters for both polarizations
+    for pol in ("te", "tm"):
+        if pol not in kappa_dict or pol not in Delta_dict or pol not in Omega_dict:
+            return None
+        kappa = kappa_dict[pol]
+        Delta = Delta_dict[pol]
+        Omega = Omega_dict[pol]
+        
+        # Check for invalid parameters
+        if not np.isfinite(kappa) or not np.isfinite(Delta) or not np.isfinite(Omega):
+            return None
+        if Omega <= 0:
+            return None
+    
+    # Compute first-0.5 lengths for each polarization: L_50_first = π/(4*Ω)
+    L_50_first_te = np.pi / (4.0 * Omega_dict["te"])
+    L_50_first_tm = np.pi / (4.0 * Omega_dict["tm"])
+    
+    # Constrain search window to first few lobes
+    # L_min = 0.5 * min(L_50_TE_first, L_50_TM_first)
+    # L_max = 2.0 * max(L_50_TE_first, L_50_TM_first)
+    search_min = 0.5 * min(L_50_first_te, L_50_first_tm)
+    search_max = 2.0 * max(L_50_first_te, L_50_first_tm)
+    
+    # Clip to safety bounds
+    search_min = max(search_min, min_len)
+    search_max = min(search_max, max_len)
+    
+    if search_min >= search_max:
+        # Fallback: use safety bounds if computed window is invalid
+        search_min = min_len
+        search_max = max_len
+    
+    # Objective function: |η_TE(L) - 0.5| + |η_TM(L) - 0.5| + tiny length regularizer
+    def objective(L):
+        eta_te = _eta_from_cmt(kappa_dict["te"], Delta_dict["te"], Omega_dict["te"], L)
+        eta_tm = _eta_from_cmt(kappa_dict["tm"], Delta_dict["tm"], Omega_dict["tm"], L)
+        cost = abs(eta_te - 0.5) + abs(eta_tm - 0.5) + 1e-3 * (L / max_len)
+        return cost
+    
+    # Try scipy optimization if available
+    if _HAS_SCIPY:
+        try:
+            result = minimize_scalar(
+                objective,
+                bounds=(search_min, search_max),
+                method='bounded',
+                options={'xatol': 1e-6}
+            )
+            if result.success:
+                return float(result.x)
+        except Exception:
+            pass
+    
+    # Fallback: grid search
+    n_points = 1000
+    L_grid = np.linspace(search_min, search_max, n_points)
+    costs = [objective(L) for L in L_grid]
+    best_idx = np.argmin(costs)
+    return float(L_grid[best_idx])
 
 
 
@@ -33,7 +147,8 @@ def compute_Lc(
         lambda0: Wavelength in µm (default: param.wl_0)
         trim_factor: Empirical trim factor for bends/transitions (default: 0.075)
         cache_dir: Directory for cache file (default: "data")
-        blend_policy: How to blend TE/TM results: "median" (default), "te", or "tm"
+        blend_policy: How to blend TE/TM results: "median" (default), "te", "tm", or "balance".
+                       "balance" minimizes |η_TE-0.5|+|η_TM-0.5| using CMT predictions.
         length_bounds: Optional tuple (min_len, max_len) to clip L_c; defaults to (3, 50) µm
     
     Returns:
@@ -71,6 +186,7 @@ def compute_Lc(
     L_50_dict = {}
     kappa_dict = {}
     Delta_dict = {}
+    Omega_dict = {}
     Cmax_dict = {}
     n1_dict = {}
     n2_dict = {}
@@ -85,6 +201,7 @@ def compute_Lc(
             Delta = cached["Delta"]
             kappa = cached["kappa"]
             L_50 = cached["L_50"]
+            Omega = S / 2  # Recompute Omega from cached S
             # Recompute Cmax on cache hit (was not stored in older cache revs)
             kappa_sq_local = float(kappa) ** 2
             den_local = kappa_sq_local + float(Delta) ** 2
@@ -218,6 +335,7 @@ def compute_Lc(
         n2_dict[pol] = n2
         Delta_dict[pol] = Delta
         kappa_dict[pol] = kappa
+        Omega_dict[pol] = Omega
         Cmax_dict[pol] = Cmax_local
         L_50_dict[pol] = L_50
     
@@ -237,6 +355,29 @@ def compute_Lc(
         L_c_raw = L_50_dict.get(blend_policy, np.inf)
         if not np.isfinite(L_c_raw):
             print(f"[L_c (ADC) WARNING] Selected polarization {blend_policy.upper()} has infinite L_50; check coupling")
+    elif blend_policy == "balance":
+        # Optimize L_c to minimize |η_TE(L) - 0.5| + |η_TM(L) - 0.5|
+        try:
+            L_c_raw = _optimize_Lc_balance(kappa_dict, Delta_dict, Omega_dict, min_len, max_len)
+            if L_c_raw is None:
+                # Optimization failed, fall back to median
+                print(f"[L_c (ADC) WARNING] Balance optimization failed, falling back to median policy")
+                finite_vals = [v for v in L_50_dict.values() if np.isfinite(v)]
+                if len(finite_vals) == 0:
+                    L_c_raw = max_len
+                elif len(finite_vals) == 1:
+                    L_c_raw = finite_vals[0]
+                else:
+                    L_c_raw = np.median(finite_vals)
+        except Exception as e:
+            print(f"[L_c (ADC) WARNING] Balance optimization error: {e}, falling back to median policy")
+            finite_vals = [v for v in L_50_dict.values() if np.isfinite(v)]
+            if len(finite_vals) == 0:
+                L_c_raw = max_len
+            elif len(finite_vals) == 1:
+                L_c_raw = finite_vals[0]
+            else:
+                L_c_raw = np.median(finite_vals)
     else:
         raise ValueError(f"Invalid blend_policy: {blend_policy}")
     

@@ -472,6 +472,13 @@ def plot_eta_overlay(results_te, results_tm, outdir="results"):
     """Overlay η_TE(λ) and η_TM(λ) for quick polarization comparison."""
     Path(outdir).mkdir(parents=True, exist_ok=True)
     lam = results_te["lam"]
+    
+    # Debug: verify data being plotted
+    idx_1550 = int(np.argmin(np.abs(lam - 1.55)))
+    eta_te_1550 = float(results_te["eta"][idx_1550])
+    eta_tm_1550 = float(results_tm["eta"][idx_1550])
+    print(f"[PLOT ETA] Plotting TE: eta(1550nm)={eta_te_1550:.3f}, TM: eta(1550nm)={eta_tm_1550:.3f}")
+    
     plt.figure()
     plt.plot(lam, results_te["eta"], label="TE")
     plt.plot(lam, results_tm["eta"], label="TM")

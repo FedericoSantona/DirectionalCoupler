@@ -2,6 +2,8 @@ import tidy3d as td
 import numpy as np
 import tidy3d.web as web
 from types import SimpleNamespace
+from pathlib import Path
+import shutil
 from simulation_utils import (
     build_sim,
     preflight,
@@ -21,14 +23,41 @@ import matplotlib.pyplot as plt
 # import need be changed in some cases
 
 
-DRY_RUN = False # set False to actually simulate
+def get_geometry_folder_name(wg_width, wg_thick, coupling_gap, delta_w, blend_policy):
+    """
+    Generate a folder name based on geometry parameters.
+    
+    Format: w{width}_t{thick}_g{gap}_d{delta_w}_b{blend_policy}
+    Example: w1p150_t0p320_g0p250_d0p020_bmedian
+    
+    Args:
+        wg_width: Waveguide width in µm
+        wg_thick: Waveguide thickness in µm
+        coupling_gap: Coupling gap in µm
+        delta_w: Asymmetric width difference in µm
+        blend_policy: Blend policy string ("median", "te", "tm", "balance")
+    
+    Returns:
+        Folder name string
+    """
+    # Format numbers: replace decimal point with 'p' and format to 3 decimal places
+    w_str = f"{wg_width:.3f}".replace('.', 'p')
+    t_str = f"{wg_thick:.3f}".replace('.', 'p')
+    g_str = f"{coupling_gap:.3f}".replace('.', 'p')
+    d_str = f"{delta_w:.3f}".replace('.', 'p')
+    
+    folder_name = f"w{w_str}_t{t_str}_g{g_str}_d{d_str}_b{blend_policy}"
+    return folder_name
+
+
+DRY_RUN = False# set False to actually simulate
 DO_SWEEP = False # set True to run a coarse one-parameter sweep
 # --- central hyperparameters (edit once, propagate everywhere) ---
 GRID_STEPS_PER_WVL_X = 6
 GRID_STEPS_PER_WVL_Y = 6
 GRID_STEPS_PER_WVL_Z = 10
 RUN_TIME = 1e-11 #s
-SHUTOFF = 5e-4 #s
+SHUTOFF = 1e-5#s
 SOURCE_DLAMBDA = 0.06  # µm span driving the Gaussian pulse
 SOURCE_NUM_FREQS = 20  # tidy3d validation prefers <= 20
 MONITOR_LAMBDA_START = 1.530 #nm
@@ -53,6 +82,8 @@ COUPLING_LENGTH_BOUNDS = (3.0, 50.0)  # µm min/max bounds for derived L_c
 FREEZE_L_C = True  # If True (default), compute L_c once at design wavelength and reuse for all λ.
                    # If False, recompute L_c(λ) per wavelength (for CMT checks, not device spectra).
                    # Default=True keeps geometry fixed during wavelength sweeps.
+COUPLING_BLEND_POLICY = "balance"  # How to blend TE/TM L50: "median" (default), "te", "tm", or "balance"
+                                    # "balance" optimizes L_c to minimize |η_TE-0.5|+|η_TM-0.5|
 
 #script parameters, input parameters for the simulation
 # Note: coupling_length will be derived from supermode analysis in update_param_derived()
@@ -62,8 +93,8 @@ wg_length = 5  #µm
 wg_width = 1.15  #µm
 wg_thick = 0.32  #µm
 wl_0 = 1.55  #µm
-coupling_gap = 0.275  #µm
-delta_w = 0.01  #µm , Asymmetric width difference: w1 = wg_width + delta_w/2, w2 = wg_width - delta_w/2
+coupling_gap = 0.265  #µm
+delta_w = 0.055  #µm , Asymmetric width difference: w1 = wg_width + delta_w/2, w2 = wg_width - delta_w/2
                # Default 0.0 for symmetric mode. Bounds: |delta_w| ≤ 0.3 µm (fabrication constraint)
 
 #calculate the size of the simulation domain (coupling_length will be computed later)
@@ -134,6 +165,34 @@ param.enable_field_monitor = ENABLE_FIELD_MONITOR
 param.coupling_trim_factor = COUPLING_TRIM_FACTOR
 param.coupling_length_bounds = COUPLING_LENGTH_BOUNDS
 param.freeze_l_c = FREEZE_L_C  # Controls whether L_c is wavelength-dependent
+param.coupling_blend_policy = COUPLING_BLEND_POLICY  # Controls how TE/TM L50 values are blended
+
+# Compute geometry-specific results folder name
+RESULTS_BASE_DIR = Path("results")
+GEOMETRY_FOLDER_NAME = get_geometry_folder_name(
+    wg_width=wg_width,
+    wg_thick=wg_thick,
+    coupling_gap=coupling_gap,
+    delta_w=delta_w,
+    blend_policy=COUPLING_BLEND_POLICY
+)
+RESULTS_DIR = RESULTS_BASE_DIR / GEOMETRY_FOLDER_NAME
+
+# Create geometry directory only for real runs (not dry runs)
+# Move existing results to geometry-specific folder if they exist in base results folder
+if not DRY_RUN:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Only move files if geometry folder is empty and base folder has files
+    if RESULTS_BASE_DIR.exists() and not any(RESULTS_DIR.iterdir()):
+        existing_files = list(RESULTS_BASE_DIR.glob("*"))
+        # Filter out directories and only move files
+        existing_files = [f for f in existing_files if f.is_file()]
+        if existing_files:
+            for file_path in existing_files:
+                dest_path = RESULTS_DIR / file_path.name
+                if not dest_path.exists():  # Only move if destination doesn't exist
+                    shutil.move(str(file_path), str(dest_path))
+                    print(f"[RESULTS] Moved {file_path.name} to {RESULTS_DIR}")
 
 # Compute derived coupling_length before building geometry
 update_param_derived(param)
@@ -190,7 +249,7 @@ def run_single(param, pol='te', task_tag='single', dry_run=False, lambda_single=
             data = res.results()
         except AttributeError:
             data = res
-        return summarize_and_save(data, pol, outdir="results", mode_solver_diag=mode_solver_diag)
+        return summarize_and_save(data, pol, outdir=str(RESULTS_DIR), mode_solver_diag=mode_solver_diag)
     finally:
          # --- RESTORE monitor settings no matter what ---
         (
@@ -244,12 +303,14 @@ if __name__ == "__main__":
             sweep(
                 GRID3D["coupling_gap"], 
                 GRID3D["wg_width"], 
+                
                 grid_length,  # None for derived-only, or array for fine-tuning
                 param=param,
                 weights=WEIGHTS,
                 run_single_fn=run_single,
                 dry_run=DRY_RUN, 
                 save_top_k=10, 
+                outdir=str(RESULTS_DIR),
                 lambda_single=1.55,
                 grid_delta_w=GRID3D.get("delta_w")  # Pass delta_w grid if present
             )
@@ -263,16 +324,22 @@ if __name__ == "__main__":
 
         # If both runs were executed, save an overlay comparison plot AND a combined CSV with Δη(λ) and band-averaged visibility
         if not DRY_RUN and all(p in results_cache for p in ("te", "tm")):
+            # Debug: verify data before plotting
+            idx_1550_te = int(np.argmin(np.abs(results_cache["te"]["lam"] - 1.55)))
+            idx_1550_tm = int(np.argmin(np.abs(results_cache["tm"]["lam"] - 1.55)))
+            print(f"\n[PLOT DEBUG] TE at 1550nm: eta={results_cache['te']['eta'][idx_1550_te]:.3f}, V={results_cache['te']['V'][idx_1550_te]:.3f}")
+            print(f"[PLOT DEBUG] TM at 1550nm: eta={results_cache['tm']['eta'][idx_1550_tm]:.3f}, V={results_cache['tm']['V'][idx_1550_tm]:.3f}")
+            
             # Overlay plots for coupling ratio and visibility
-            plot_eta_overlay(results_cache["te"], results_cache["tm"], outdir="results")
-            plot_visibility_overlay(results_cache["te"], results_cache["tm"], outdir="results")
+            plot_eta_overlay(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))
+            plot_visibility_overlay(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))
 
             # Combine TE/TM spectra into a single CSV
-            delta_eta = save_combined_te_tm_csv(results_cache["te"], results_cache["tm"], outdir="results")
+            delta_eta = save_combined_te_tm_csv(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))
 
             # Compute and save band-averaged visibilities
-            compute_and_save_band_averaged_visibility(results_cache["te"], results_cache["tm"], param, outdir="results")
+            compute_and_save_band_averaged_visibility(results_cache["te"], results_cache["tm"], param, outdir=str(RESULTS_DIR))
 
             # Plot polarization imbalance Δη(λ) and ΔV(λ)
-            plot_delta_eta(results_cache["te"]["lam"], delta_eta, outdir="results")
-            plot_delta_visibility(results_cache["te"], results_cache["tm"], outdir="results")
+            plot_delta_eta(results_cache["te"]["lam"], delta_eta, outdir=str(RESULTS_DIR))
+            plot_delta_visibility(results_cache["te"], results_cache["tm"], outdir=str(RESULTS_DIR))
