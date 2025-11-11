@@ -481,8 +481,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-step", type=float, default=0.005, help="Seed scan step for solve_delta_w_star")
     parser.add_argument("--max-iter", type=int, default=80, help="Maximum Newton iterations")
     parser.add_argument("--csv", type=str, default="results/sweeps/tune_geometry.csv", help="Path to save detailed CSV results")
-    parser.add_argument("--resume", action="store_true", help="Skip geometries already present in the CSV")
-    parser.add_argument("--rewrite", action="store_true", help="Ignore existing CSV contents and start over")
+    parser.add_argument("--resume", type=bool, default=True, help="Skip geometries already present in the CSV")
+    parser.add_argument("--rewrite", type=bool, default=False, help="Ignore existing CSV contents and start over")
     return parser.parse_args()
 
 
@@ -513,10 +513,6 @@ def main() -> None:
         resume=args.resume and not args.rewrite,
     )
     print_summary(results)
-    if args.csv:
-        # Ensure final file reflects the completed sweep (already written incrementally)
-        write_csv(results, args.csv)
-        print(f"\n[INFO] Wrote CSV results to {args.csv}")
 
 
 if __name__ == "__main__":
