@@ -55,7 +55,7 @@ def _centerline_offsets(param):
 
 
 # --- recompute derived domain sizes when a parameter changes ---
-def update_param_derived(p, lambda_eval=None):
+def update_param_derived(p, lambda_eval=None, solve_delta_w=False, delta_w_init=None):
     """
     Recompute derived parameters including coupling_length from supermode analysis.
     Always uses compute_Lc() which gracefully handles symmetric or asymmetric case.
@@ -63,9 +63,143 @@ def update_param_derived(p, lambda_eval=None):
     Args:
         p: Parameter namespace
         lambda_eval: Optional wavelength for per-lambda L_c recomputation (if freeze_l_c=False)
+        solve_delta_w: If True, solve for delta_w* to equalize L_50_TE and L_50_TM
+        delta_w_init: Optional initial guess for warm-start (µm)
     """
     # Import here to avoid circular dependency
     from coupling_length import compute_Lc
+    from delta_width import solve_delta_w_star
+    
+    # Step 0: If solve_delta_w=True, solve for delta_w* first
+    if solve_delta_w:
+        w = float(getattr(p, 'wg_width', 0))
+        g = float(getattr(p, 'coupling_gap', 0))
+        t = float(getattr(p, 'wg_thick', 0))
+        lambda0 = getattr(p, 'lambda_single', p.wl_0)
+        
+        # Get tolerance and search bound hyperparameters
+        abs_tol = getattr(p, 'delta_w_abs_tol', 0.05)  # Default 0.05 µm
+        rel_tol = getattr(p, 'delta_w_rel_tol', 0.01)  # Default 1% (0.01)
+        search_min = getattr(p, 'delta_w_search_min', -0.20)  # Default -0.20 µm
+        search_max = getattr(p, 'delta_w_search_max', +0.20)  # Default +0.20 µm
+        hard_min = getattr(p, 'delta_w_hard_min', -0.30)  # Default -0.30 µm
+        hard_max = getattr(p, 'delta_w_hard_max', +0.30)  # Default +0.30 µm
+        
+        # Get Newton solver hyperparameters
+        h_init = getattr(p, 'delta_w_h_init', 0.01)  # Default 0.01 µm
+        h_min = getattr(p, 'delta_w_h_min', 0.001)  # Default 0.001 µm
+        max_iter = getattr(p, 'delta_w_max_iter', 50)  # Default 50 iterations
+        eps_min = getattr(p, 'delta_w_eps_min', 1e-6)  # Default 1e-6
+        
+        # Store search bounds for logging
+        search_min_log = search_min
+        search_max_log = search_max
+        
+        delta_w_star, diagnostics = solve_delta_w_star(
+            w=w,
+            g=g,
+            t=t,
+            lambda0=lambda0,
+            param_template=p,
+            delta_w_init=delta_w_init,
+            cache_dir="data",
+            abs_tol=abs_tol,
+            rel_tol=rel_tol,
+            search_min=search_min,
+            search_max=search_max,
+            hard_min=hard_min,
+            hard_max=hard_max,
+            h_init=h_init,
+            h_min=h_min,
+            max_iter=max_iter,
+            eps_min=eps_min
+        )
+        
+        if delta_w_star is None:
+            # Infeasible: determine which polarization failed
+            pol_failed = "TE" if diagnostics.get('Delta_te', 0) > diagnostics.get('kappa_te', 0) else "TM"
+            print(f"\n{'='*80}")
+            print(f"[Δw* Solver] ✗ INFEASIBLE")
+            print(f"{'─'*80}")
+            print(f"  Geometry:  w={w:.2f} µm, g={g:.3f} µm, t={t:.3f} µm")
+            print(f"  Reason:    |Δ_pol| > κ_pol ({pol_failed}) for all Δw in [{search_min_log:.2f}, {search_max_log:.2f}] µm")
+            print(f"  Status:    No valid solution found - geometry cannot achieve 50:50 coupling")
+            print(f"{'='*80}\n")
+            p.delta_w_diagnostics = diagnostics
+            # Set delta_w to 0.0 as fallback (will be skipped downstream)
+            p.delta_w = 0.0
+            return  # Skip further computation
+        
+        # Set delta_w* and store diagnostics
+        p.delta_w = delta_w_star
+        p.delta_w_diagnostics = diagnostics
+        
+        # Print concise log line with improved formatting
+        abs_err = diagnostics.get('abs_err', np.nan)
+        rel_err = diagnostics.get('rel_err', np.nan) * 100  # Convert to percent
+        L50_te = diagnostics.get('L50_te', np.nan)
+        L50_tm = diagnostics.get('L50_tm', np.nan)
+        n_brackets = diagnostics.get('n_brackets', 0)
+        refine_used = diagnostics.get('refine_used', False)
+        tolerance_met = diagnostics.get('tolerance_met', True)
+        
+        # Format status indicators
+        status_icon = "✓" if tolerance_met else "⚠"
+        method_str = "brentq" if n_brackets > 0 else ("minimize" if refine_used else "grid")
+        
+        # Print formatted report
+        print(f"\n{'='*80}")
+        print(f"[Δw* Solver] {status_icon} {'SUCCESS' if tolerance_met else 'WARNING'}")
+        print(f"{'─'*80}")
+        print(f"  Geometry:  w={w:.2f} µm, g={g:.3f} µm, t={t:.3f} µm")
+        print(f"  Solution:  Δw* = {delta_w_star:+.4f} µm")
+        print(f"  L50 values: TE = {L50_te:.3f} µm,  TM = {L50_tm:.3f} µm")
+        print(f"  Error:     abs = {abs_err:.4f} µm,  rel = {rel_err:.2f}%")
+        print(f"  Tolerance: abs ≤ {abs_tol:.3f} µm,  rel ≤ {rel_tol*100:.1f}%")
+        print(f"  Method:    {method_str} ({n_brackets} brackets, refine={'yes' if refine_used else 'no'})")
+        
+        if not tolerance_met:
+            print(f"{'─'*80}")
+            print(f"  ⚠ WARNING: Tolerance not met!")
+            print(f"  Possible causes:")
+            print(f"    • Geometry (w={w:.2f}, g={g:.3f}) may not allow perfect L50 equalization")
+            print(f"    • Search bounds may be too narrow (current: [{search_min_log:.2f}, {search_max_log:.2f}] µm)")
+            print(f"    • Grid resolution may be insufficient")
+        
+        print(f"{'='*80}\n")
+        
+        # After finding delta_w*, recompute L_c with the chosen blend policy + trim
+        # This ensures L_c is computed at the final delta_w* value
+        lambda0_solve = getattr(p, 'lambda_single', p.wl_0)
+        p.coupling_length = compute_Lc(
+            param=p,
+            lambda0=lambda0_solve,
+            trim_factor=getattr(p, 'coupling_trim_factor', 0.075),
+            cache_dir="data",
+            blend_policy=getattr(p, 'coupling_blend_policy', 'median'),
+            length_bounds=getattr(p, 'coupling_length_bounds', None),
+        )
+        # Update geometry signature to avoid redundant recomputation
+        w1_temp = w + delta_w_star / 2
+        w2_temp = w - delta_w_star / 2
+        freeze = getattr(p, 'freeze_l_c', True)
+        use_dispersive = getattr(p.medium, 'use_dispersive', False)
+        if use_dispersive and not freeze:
+            p._last_geometry_for_lc = (
+                w1_temp, w2_temp,
+                float(g),
+                float(t),
+                lambda0_solve,
+                "dispersive",
+            )
+        else:
+            p._last_geometry_for_lc = (
+                w1_temp, w2_temp,
+                float(g),
+                float(t),
+                float(getattr(p.medium.SiN, 'permittivity', 1.0)),
+                float(getattr(p.medium.SiO2, 'permittivity', 1.0)),
+            )
     
     # Step 1: Compute arm widths (w1, w2) from wg_width/delta_w
     wg_width = float(getattr(p, 'wg_width', 0))

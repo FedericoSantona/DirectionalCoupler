@@ -6,7 +6,49 @@ import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
 import pickle
+import warnings
+import logging
+import sys
+import os
 from building_utils import generate_object, make_source, make_monitors, resolve_mode_spec
+
+# Suppress verbose tidy3d mode solver warnings about field decay at boundaries
+# These warnings are common and don't affect accuracy for mode solving
+warnings.filterwarnings('ignore', message='.*Mode field.*does not decay at the plane boundaries.*')
+warnings.filterwarnings('ignore', message='.*Use the remote mode solver.*')
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# Also suppress tidy3d logging if it uses logging module
+logging.getLogger('tidy3d').setLevel(logging.ERROR)
+logging.getLogger('tidy3d.plugins.mode').setLevel(logging.ERROR)
+
+# Context manager to suppress warnings during mode solver calls
+class _SuppressTidy3dWarnings:
+    """Context manager to suppress tidy3d mode solver warnings."""
+    def __init__(self):
+        self._original_stderr = None
+        self._original_warnings = None
+        self._devnull = None
+    
+    def __enter__(self):
+        self._original_warnings = warnings.filters[:]
+        warnings.filterwarnings('ignore')
+        # Redirect stderr to suppress tidy3d's direct print statements
+        self._devnull = open(os.devnull, 'w')
+        self._original_stderr = sys.stderr
+        sys.stderr = self._devnull
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Restore stderr
+        if self._original_stderr is not None:
+            sys.stderr = self._original_stderr
+        if self._devnull is not None:
+            self._devnull.close()
+        # Restore warnings
+        if self._original_warnings is not None:
+            warnings.filters[:] = self._original_warnings
+        return False
 
 try:
     from tidy3d.plugins.mode import ModeSolver as _ModeSolver
@@ -68,25 +110,26 @@ def compute_mode_solver_diagnostics(sim, param, pol, lambda_eval=1.55):
             center=[param.size_x / 2 - param.wl_0, 0.0, 0.0],
             size=[0.0, 0.95 * size_y, 0.95 * size_z],
         )
-        ms = _ModeSolver(
-            simulation=sim,
-            plane=plane_box,
-            mode_spec=mode_spec,
-            freqs=[td.C_0 / lambda_eval],
-            fields=("Ey", "Ez"),
-        )
-        try:
-            task_name = f"ModeDiag_{pol}_{lambda_eval:.3f}"
-            path = f"./data/mode_solver_{pol}.hdf5"
-            res = web.run(ms, task_name=task_name, path=path)
+        with _SuppressTidy3dWarnings():
+            ms = _ModeSolver(
+                simulation=sim,
+                plane=plane_box,
+                mode_spec=mode_spec,
+                freqs=[td.C_0 / lambda_eval],
+                fields=("Ey", "Ez"),
+            )
             try:
-                sol = res.results()
-            except AttributeError:
-                sol = res
-        except Exception as remote_exc:
-            # fall back to local solver if remote execution is unavailable
-            diag["warning"] = f"remote mode solver failed: {remote_exc}"
-            sol = ms.solve()
+                task_name = f"ModeDiag_{pol}_{lambda_eval:.3f}"
+                path = f"./data/mode_solver_{pol}.hdf5"
+                res = web.run(ms, task_name=task_name, path=path)
+                try:
+                    sol = res.results()
+                except AttributeError:
+                    sol = res
+            except Exception as remote_exc:
+                # fall back to local solver if remote execution is unavailable
+                diag["warning"] = f"remote mode solver failed: {remote_exc}"
+                sol = ms.solve()
         neff = getattr(sol, "n_eff", None)
         if neff is not None:
             neff_arr = np.array(neff)
@@ -156,16 +199,16 @@ def pick_mode_index_at_source(sim, param, pol, lambda_um=1.55, n_modes=6):
         target_neff=target_neff,
     )
 
-    solver = _ModeSolver(
-        simulation=sim,
-        plane=plane_box,
-        mode_spec=mode_spec,
-        freqs=[td.C_0 / lambda_um],
-        direction=getattr(source, "direction", "+"),
-        fields=("Ey", "Ez"),
-    )
-
-    sol = solver.solve()
+    with _SuppressTidy3dWarnings():
+        solver = _ModeSolver(
+            simulation=sim,
+            plane=plane_box,
+            mode_spec=mode_spec,
+            freqs=[td.C_0 / lambda_um],
+            direction=getattr(source, "direction", "+"),
+            fields=("Ey", "Ez"),
+        )
+        sol = solver.solve()
 
     neff_arr = np.array(sol.n_eff)
     if neff_arr.ndim >= 2:

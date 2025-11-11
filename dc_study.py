@@ -25,18 +25,17 @@ from material_dispersion import get_permittivity_SiO2, get_permittivity_SiN
 # import need be changed in some cases
 
 
-def get_geometry_folder_name(wg_width, wg_thick, coupling_gap, delta_w, blend_policy):
+def get_geometry_folder_name(wg_width, wg_thick, coupling_gap, blend_policy):
     """
     Generate a folder name based on geometry parameters.
     
-    Format: w{width}_t{thick}_g{gap}_d{delta_w}_b{blend_policy}
-    Example: w1p150_t0p320_g0p250_d0p020_bmedian
+    Format: w{width}_t{thick}_g{gap}_b{blend_policy}
+    Example: w1p150_t0p320_g0p250_bmedian
     
     Args:
         wg_width: Waveguide width in µm
         wg_thick: Waveguide thickness in µm
         coupling_gap: Coupling gap in µm
-        delta_w: Asymmetric width difference in µm
         blend_policy: Blend policy string ("median", "te", "tm", "balance")
     
     Returns:
@@ -46,9 +45,8 @@ def get_geometry_folder_name(wg_width, wg_thick, coupling_gap, delta_w, blend_po
     w_str = f"{wg_width:.3f}".replace('.', 'p')
     t_str = f"{wg_thick:.3f}".replace('.', 'p')
     g_str = f"{coupling_gap:.3f}".replace('.', 'p')
-    d_str = f"{delta_w:.3f}".replace('.', 'p')
     
-    folder_name = f"w{w_str}_t{t_str}_g{g_str}_d{d_str}_b{blend_policy}"
+    folder_name = f"w{w_str}_t{t_str}_g{g_str}_b{blend_policy}"
     return folder_name
 
 
@@ -59,7 +57,7 @@ GRID_STEPS_PER_WVL_X = 6
 GRID_STEPS_PER_WVL_Y = 6
 GRID_STEPS_PER_WVL_Z = 10
 RUN_TIME = 1e-11 #s
-SHUTOFF = 1e-5#s
+SHUTOFF = 1e-6#s
 SOURCE_DLAMBDA = 0.06  # µm span driving the Gaussian pulse
 SOURCE_NUM_FREQS = 20  # tidy3d validation prefers <= 20
 MONITOR_LAMBDA_START = 1.530 #nm
@@ -79,13 +77,28 @@ WEIGHTS = {
 }
 
 # --- Coupling length derivation parameters ---
-COUPLING_TRIM_FACTOR = 0.05  # 7.5% empirical trim for bend/transition effects (configurable)
+COUPLING_TRIM_FACTOR = 0.0  # 10% trim for bend/transition effects (δ ∈ [0.05, 0.10] per derivation)
+                              # The balance optimization now accounts for trim factor, so this can be 
+                              # set to the typical value. Adjust based on FDTD calibration if needed.
 COUPLING_LENGTH_BOUNDS = (3.0, 50.0)  # µm min/max bounds for derived L_c
 FREEZE_L_C = True  # If True (default), compute L_c once at design wavelength and reuse for all λ.
                    # If False, recompute L_c(λ) per wavelength (for CMT checks, not device spectra).
                    # Default=True keeps geometry fixed during wavelength sweeps.
 COUPLING_BLEND_POLICY = "balance"  # How to blend TE/TM L50: "median" (default), "te", "tm", or "balance"
                                     # "balance" optimizes L_c to minimize |η_TE-0.5|+|η_TM-0.5|
+SOLVE_DELTA_W = True  # If True, solve for delta_w* to equalize L_50_TE and L_50_TM (asymmetry-first strategy)
+                      # If False, use symmetric mode (delta_w=0) or manually set delta_w
+DELTA_W_ABS_TOL = 0.05  # Absolute tolerance for L50_TE - L50_TM matching (µm)
+DELTA_W_REL_TOL = 0.01  # Relative tolerance for L50_TE - L50_TM matching (1% = 0.01)
+DELTA_W_SEARCH_MIN = -0.6  # Primary search box minimum (µm)
+DELTA_W_SEARCH_MAX = +0.6  # Primary search box maximum (µm)
+DELTA_W_HARD_MIN = -1  # Hard clip minimum (µm) - fabrication constraint
+DELTA_W_HARD_MAX = +1  # Hard clip maximum (µm) - fabrication constraint
+# Newton solver hyperparameters
+DELTA_W_H_INIT = 0.01  # Initial step size for finite differences (µm)
+DELTA_W_H_MIN = 0.001  # Minimum step size for finite differences (µm)
+DELTA_W_MAX_ITER = 200  # Maximum Newton iterations
+DELTA_W_EPS_MIN = 1e-6  # Minimum |F'| threshold for derivative computation
 
 # --- Material dispersion configuration ---
 USE_DISPERSIVE_MATERIALS = True  # If True, use wavelength-dependent refractive indices (Sellmeier)
@@ -93,15 +106,15 @@ USE_DISPERSIVE_MATERIALS = True  # If True, use wavelength-dependent refractive 
 
 #script parameters, input parameters for the simulation
 # Note: coupling_length will be derived from supermode analysis in update_param_derived()
+# Note: delta_w will be solved (not set) when SOLVE_DELTA_W=True (asymmetry-first strategy)
 sbend_length = 8  #µm
 sbend_height = 0.5  #µm
 wg_length = 5  #µm
-wg_width = 1.10  #µm
-wg_thick = 0.32  #µm
+wg_width = 1.1 #µm
+wg_thick = 0.28  #µm
 wl_0 = 1.55  #µm
-coupling_gap = 0.265  #µm
-delta_w = -0.06  #µm , Asymmetric width difference: w1 = wg_width + delta_w/2, w2 = wg_width - delta_w/2
-               # Default 0.0 for symmetric mode. Bounds: |delta_w| ≤ 0.3 µm (fabrication constraint)
+coupling_gap = 0.28  #µm
+# delta_w is now solved (not a free parameter) when SOLVE_DELTA_W=True
 
 #calculate the size of the simulation domain (coupling_length will be computed later)
 size_x = 2*(wg_length+sbend_length) + 0.0  # Will be computed from derived coupling_length
@@ -174,11 +187,8 @@ param = SimpleNamespace(
     size_z=size_z,
     freq_0=freq_0,
     coupling_gap=coupling_gap,
-    delta_w=delta_w  # Asymmetric width difference
+    delta_w=0.0  # Will be solved if SOLVE_DELTA_W=True, otherwise symmetric (0.0)
 )
-# Validate delta_w bounds
-if abs(delta_w) > 0.3:
-    raise ValueError(f"delta_w={delta_w:.3f} µm exceeds fabrication constraint |delta_w| ≤ 0.3 µm")
 param.pad_extra = Y_PAD_EXTRA
 param.medium = SimpleNamespace(
     Vacuum=td.Medium(permittivity=1.0),
@@ -213,6 +223,16 @@ param.coupling_trim_factor = COUPLING_TRIM_FACTOR
 param.coupling_length_bounds = COUPLING_LENGTH_BOUNDS
 param.freeze_l_c = FREEZE_L_C  # Controls whether L_c is wavelength-dependent
 param.coupling_blend_policy = COUPLING_BLEND_POLICY  # Controls how TE/TM L50 values are blended
+param.delta_w_abs_tol = DELTA_W_ABS_TOL  # Absolute tolerance for delta_w* solver (µm)
+param.delta_w_rel_tol = DELTA_W_REL_TOL  # Relative tolerance for delta_w* solver (fraction, e.g., 0.01 = 1%)
+param.delta_w_search_min = DELTA_W_SEARCH_MIN  # Primary search box minimum (µm)
+param.delta_w_search_max = DELTA_W_SEARCH_MAX  # Primary search box maximum (µm)
+param.delta_w_hard_min = DELTA_W_HARD_MIN  # Hard clip minimum (µm)
+param.delta_w_hard_max = DELTA_W_HARD_MAX  # Hard clip maximum (µm)
+param.delta_w_h_init = DELTA_W_H_INIT  # Initial step size for finite differences (µm)
+param.delta_w_h_min = DELTA_W_H_MIN  # Minimum step size for finite differences (µm)
+param.delta_w_max_iter = DELTA_W_MAX_ITER  # Maximum Newton iterations
+param.delta_w_eps_min = DELTA_W_EPS_MIN  # Minimum |F'| threshold for derivative computation
 
 # Compute geometry-specific results folder name
 RESULTS_BASE_DIR = Path("results")
@@ -220,7 +240,6 @@ GEOMETRY_FOLDER_NAME = get_geometry_folder_name(
     wg_width=wg_width,
     wg_thick=wg_thick,
     coupling_gap=coupling_gap,
-    delta_w=delta_w,
     blend_policy=COUPLING_BLEND_POLICY
 )
 RESULTS_DIR = RESULTS_BASE_DIR / GEOMETRY_FOLDER_NAME
@@ -242,10 +261,16 @@ if not DRY_RUN:
                     print(f"[RESULTS] Moved {file_path.name} to {RESULTS_DIR}")
 
 # Compute derived coupling_length before building geometry
-update_param_derived(param)
-
-generate_object_result = generate_object(param)
-generate_object_result = generate_object_result if isinstance(generate_object_result, list) else [generate_object_result]
+# If SOLVE_DELTA_W=True, delta_w* will be solved to equalize L_50_TE and L_50_TM
+# Skip if being imported by tune_geometry.py to avoid unnecessary computation
+_is_tune_geometry_import = any('tune_geometry' in str(frame.filename) for frame in __import__('inspect').stack())
+if not _is_tune_geometry_import:
+    update_param_derived(param, solve_delta_w=SOLVE_DELTA_W)
+    generate_object_result = generate_object(param)
+    generate_object_result = generate_object_result if isinstance(generate_object_result, list) else [generate_object_result]
+else:
+    # When imported by tune_geometry, skip generate_object (not needed)
+    generate_object_result = []
 
 # --- runners & sweep utilities ---
 def run_single(param, pol='te', task_tag='single', dry_run=False, lambda_single=None):
@@ -332,7 +357,7 @@ if __name__ == "__main__":
             GRID3D = {
                 "coupling_gap":    np.round(np.linspace(0.24, 0.34, 2), 3),   # µm
                 "wg_width":        np.round(np.linspace(1.20, 1.60, 2), 3),   # µm
-                "delta_w":         np.round(np.linspace(-0.2, 0.2, 5), 3),    # µm asymmetric width difference
+                # delta_w is now solved (not swept) using asymmetry-first strategy
                 # coupling_length is now derived, not swept in main grid
             }
             
@@ -342,7 +367,7 @@ if __name__ == "__main__":
                 # Derive base L_c first to create fine-tuning grid
                 # This will be recomputed per (gap, width) in the sweep, but we need a preview
                 temp_param = SimpleNamespace(**param.__dict__)
-                update_param_derived(temp_param)
+                update_param_derived(temp_param, solve_delta_w=SOLVE_DELTA_W)
                 base_Lc = temp_param.coupling_length
                 grid_length = np.linspace(L_TUNE_RANGE[0]*base_Lc, L_TUNE_RANGE[1]*base_Lc, L_TUNE_POINTS)
                 print(f"[SWEEP] L_c fine-tuning enabled: {L_TUNE_RANGE[0]:.1%} to {L_TUNE_RANGE[1]:.1%} × {base_Lc:.3f}µm = [{grid_length[0]:.3f}, {grid_length[-1]:.3f}] µm")
@@ -350,7 +375,6 @@ if __name__ == "__main__":
             sweep(
                 GRID3D["coupling_gap"], 
                 GRID3D["wg_width"], 
-                
                 grid_length,  # None for derived-only, or array for fine-tuning
                 param=param,
                 weights=WEIGHTS,
@@ -358,8 +382,7 @@ if __name__ == "__main__":
                 dry_run=DRY_RUN, 
                 save_top_k=10, 
                 outdir=str(RESULTS_DIR),
-                lambda_single=1.55,
-                grid_delta_w=GRID3D.get("delta_w")  # Pass delta_w grid if present
+                lambda_single=1.55
             )
       
     else:

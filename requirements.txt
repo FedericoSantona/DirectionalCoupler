@@ -3,3 +3,4 @@ matplotlib
 tidy3d
 shapely
 tidy3d-lambda
+tqdm
