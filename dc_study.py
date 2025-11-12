@@ -120,7 +120,7 @@ coupling_gap = 0.28  #µm
 # Optional fine-tuning parameters for L_c (only if needed)
 ENABLE_L_FINE_TUNE = True  # Set True to add trim-factor sweep around derived L_c
 L_TUNE_TRIM_RANGE = (-0.15, 0.15)  # Fractional trim offsets (e.g., ±15%)
-L_TUNE_POINTS = 4  # Number of trim samples within the range
+L_TUNE_POINTS = 6  # Number of trim samples within the range
 
 #calculate the size of the simulation domain (coupling_length will be computed later)
 size_x = 2*(wg_length+sbend_length) + 0.0  # Will be computed from derived coupling_length
@@ -335,7 +335,7 @@ def _append_trim_log(row_dict):
 
 def compute_objective(results_te, results_tm, param, weights):
     lam = results_te["lam"]
-    mask = (lam >= 1.530) & (lam <= 1.565)
+    mask = (lam >= MONITOR_LAMBDA_START) & (lam <= MONITOR_LAMBDA_STOP)
     def _avg(arr):
         arr = np.asarray(arr)
         sel = arr[mask] if mask.any() else arr
@@ -498,8 +498,11 @@ if __name__ == "__main__":
         trial_param.coupling_trim_factor = base_trim + trim
         update_param_derived(trial_param, solve_delta_w=SOLVE_DELTA_W)
         trial_results = {}
+        # Only use lambda_single during fine-tuning (when multiple trim values)
+        use_lambda_single = ENABLE_L_FINE_TUNE and not DRY_RUN and len(trim_values) > 1
+        lambda_arg = wl_0 if use_lambda_single else None
         for pol in RUN_POLS:
-            summary = run_single(trial_param, pol=pol, task_tag=f"full_trim_{trim:+.3f}", dry_run=DRY_RUN)
+            summary = run_single(trial_param, pol=pol, task_tag=f"full_trim_{trim:+.3f}", dry_run=DRY_RUN, lambda_single=lambda_arg)
             if summary is not None:
                 trial_results[pol] = summary
         if DRY_RUN:

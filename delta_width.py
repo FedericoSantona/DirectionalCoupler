@@ -29,13 +29,19 @@ from math import log
 _LAST_DELTA_W_HINT = None
 
 
-def _evaluate_L50(delta_w, param, lambda0, cache_dir, eval_cache=None, cache_precision=8):
+def _evaluate_L50(delta_w, param, lambda0, cache_dir, eval_cache=None, cache_precision=8, verbose=False):
     """
     Evaluate coupled-mode quantities for a given Δw, reusing cached results when possible.
     """
     key = round(float(delta_w), cache_precision)
     if eval_cache is not None and key in eval_cache:
+        if verbose:
+            print(f"[Mode Solver] Cache hit for Δw={delta_w:.6f} µm", flush=True)
         return eval_cache[key]
+    
+    if verbose:
+        print(f"[Mode Solver] Computing for Δw={delta_w:.6f} µm (this may take a while)...", flush=True)
+    
     from types import SimpleNamespace
     temp_param = SimpleNamespace(**param.__dict__)
     temp_param.delta_w = float(delta_w)
@@ -43,7 +49,13 @@ def _evaluate_L50(delta_w, param, lambda0, cache_dir, eval_cache=None, cache_pre
     try:
         with _SuppressTidy3dWarnings():
             result = _compute_L50_per_pol(temp_param, lambda0, cache_dir)
-    except Exception:
+        if verbose and result is not None:
+            L50_te = result.get('L_50_dict', {}).get('te', np.nan)
+            L50_tm = result.get('L_50_dict', {}).get('tm', np.nan)
+            print(f"[Mode Solver] Complete: L50_TE={L50_te:.3f} µm, L50_TM={L50_tm:.3f} µm", flush=True)
+    except Exception as e:
+        if verbose:
+            print(f"[Mode Solver] Failed: {e}", flush=True)
         result = None
     if eval_cache is not None:
         eval_cache[key] = result
@@ -58,12 +70,12 @@ def _validate_param(param):
     if not hasattr(param, 'wg_thick') or param.wg_thick is None:
         raise ValueError("param must have wg_thick set")
 
-def _G_of_dw(delta_w, param, lambda0, cache_dir, eval_cache=None):
+def _G_of_dw(delta_w, param, lambda0, cache_dir, eval_cache=None, verbose=False):
     """
     Evaluate G(Δw) = log(L50_TE / L50_TM) using natural log.
     Returns (G_val, L50_te, L50_tm) or (None, None, None) if infeasible.
     """
-    result = _evaluate_L50(delta_w, param, lambda0, cache_dir, eval_cache)
+    result = _evaluate_L50(delta_w, param, lambda0, cache_dir, eval_cache, verbose=verbose)
     if result is None:
         return None, None, None
     L50_te = result['L_50_dict']['te']
@@ -130,6 +142,7 @@ def _heuristic_seed_search(param, lambda0, cache_dir, search_min, search_max,
     last_err = {+1: np.inf, -1: np.inf}
     unimproved = {+1: 0, -1: 0}
     evaluations = 0
+    progress_interval = max(1, max_evals // 10)  # Print progress every ~10% of max_evals
 
     def _eval_dw(dw, direction=None):
         nonlocal best_seed, best_abs_err, evaluations
@@ -141,8 +154,26 @@ def _heuristic_seed_search(param, lambda0, cache_dir, search_min, search_max,
             return
         visited.add(key)
         evaluations += 1
-        result = _G_of_dw(dw, param, lambda0, cache_dir, eval_cache)
+        
+        # Print progress periodically
+        if evaluations % progress_interval == 0 or evaluations == 1:
+            if np.isfinite(best_abs_err):
+                print(f"[Δw* Seed Search] Evaluation {evaluations}/{max_evals}, "
+                      f"best |L50_TE-L50_TM|={best_abs_err:.4f} µm", flush=True)
+            else:
+                print(f"[Δw* Seed Search] Evaluation {evaluations}/{max_evals}, "
+                      f"searching for feasible points...", flush=True)
+        
+        # Always show when starting a new evaluation (helps identify slow ones)
+        if evaluations > 1 and evaluations % progress_interval != 0:
+            print(f"[Δw* Seed Search] Evaluation {evaluations}/{max_evals}: computing at Δw={dw:.6f} µm...", flush=True)
+        
+        # Show verbose mode solver messages for all evaluations (helps identify slow mode solves)
+        verbose_mode = True
+        result = _G_of_dw(dw, param, lambda0, cache_dir, eval_cache, verbose=verbose_mode)
         if result[0] is None:
+            if evaluations > 1 and evaluations % progress_interval != 0:
+                print(f"[Δw* Seed Search] Evaluation {evaluations}: infeasible point, skipping", flush=True)
             return
         G_val, L50_te, L50_tm = result
         abs_err = abs(L50_te - L50_tm)
@@ -150,6 +181,11 @@ def _heuristic_seed_search(param, lambda0, cache_dir, search_min, search_max,
         if improved:
             best_seed = (dw, G_val, L50_te, L50_tm)
             best_abs_err = abs_err
+            if abs_err <= abs_tol:
+                print(f"[Δw* Seed Search] ✓ Found seed meeting tolerance: "
+                      f"Δw={dw:.6f} µm, |L50_TE-L50_TM|={abs_err:.4f} µm", flush=True)
+            elif evaluations > 1 and evaluations % progress_interval != 0:
+                print(f"[Δw* Seed Search] Evaluation {evaluations}: improved best to |L50_TE-L50_TM|={abs_err:.4f} µm", flush=True)
         if direction is not None:
             if improved:
                 unimproved[direction] = 0
@@ -165,16 +201,68 @@ def _heuristic_seed_search(param, lambda0, cache_dir, search_min, search_max,
 
     radius = max(seed_step, 0.0025)
     max_radius = max(search_max - search_min, radius)
+    print(f"[Δw* Seed Search] Starting radius search: initial radius={radius:.6f} µm, max_radius={max_radius:.6f} µm, "
+          f"evaluations so far={evaluations}/{max_evals}", flush=True)
+    iteration = 0
+    stuck_iterations = 0
+    last_evaluations = evaluations
     while evaluations < max_evals and radius <= max_radius + 1e-12:
+        iteration += 1
+        if iteration > 1:
+            print(f"[Δw* Seed Search] Radius iteration {iteration}: radius={radius:.6f} µm, evaluations={evaluations}/{max_evals}", flush=True)
+        
+        evaluations_before_loop = evaluations
         for direction in (+1, -1):
             candidate = center_guess + direction * radius
+            # Check if candidate is already visited before calling _eval_dw
+            candidate_key = round(float(np.clip(candidate, search_min, search_max)), 6)
+            if candidate_key in visited:
+                continue  # Skip already visited points
             _eval_dw(candidate, direction)
             if best_abs_err <= abs_tol:
                 return best_seed, best_abs_err
+        
+        # Check if we made any progress (new evaluations)
+        if evaluations == evaluations_before_loop:
+            stuck_iterations += 1
+            if stuck_iterations >= 3:
+                print(f"[Δw* Seed Search] No progress for {stuck_iterations} iterations (all candidates already visited), breaking", flush=True)
+                break
+        else:
+            stuck_iterations = 0
+        
+        # Show progress after completing both directions for this radius
+        if iteration > 1 or evaluations >= 25:
+            print(f"[Δw* Seed Search] Completed radius {radius:.6f} µm: evaluations={evaluations}/{max_evals}, "
+                  f"best |L50_TE-L50_TM|={best_abs_err:.4f} µm", flush=True)
         if unimproved[+1] >= 2 and unimproved[-1] >= 2:
+            print(f"[Δw* Seed Search] Early stopping: no improvement in both directions "
+                  f"(evaluations: {evaluations}/{max_evals})", flush=True)
             break
+        old_radius = radius
         radius = min(radius * 1.5, max_radius)
+        if radius == max_radius and old_radius < max_radius:
+            print(f"[Δw* Seed Search] Reached max radius {max_radius:.6f} µm", flush=True)
+            # If we've reached max radius and no new evaluations, break
+            if evaluations == last_evaluations:
+                print(f"[Δw* Seed Search] No new evaluations at max radius, breaking", flush=True)
+                break
+        last_evaluations = evaluations
+    
+    # Loop exited - show why
+    if evaluations >= max_evals:
+        print(f"[Δw* Seed Search] Loop exited: reached max evaluations ({max_evals})", flush=True)
+    elif radius > max_radius + 1e-12:
+        print(f"[Δw* Seed Search] Loop exited: radius {radius:.6f} µm exceeded max {max_radius:.6f} µm", flush=True)
+    else:
+        print(f"[Δw* Seed Search] Loop exited: unknown reason (evaluations={evaluations}, radius={radius:.6f})", flush=True)
 
+    if best_seed is not None:
+        print(f"[Δw* Seed Search] Completed: {evaluations} evaluations, "
+              f"best |L50_TE-L50_TM|={best_abs_err:.4f} µm at Δw={best_seed[0]:.6f} µm", flush=True)
+    else:
+        print(f"[Δw* Seed Search] Completed: {evaluations} evaluations, no feasible seed found", flush=True)
+    
     return best_seed, best_abs_err
 
 
@@ -366,9 +454,16 @@ def _solve_delta_w_star_newton(w, g, t, lambda0, param_template, delta_w_init=No
     if eval_cache is None:
         eval_cache = {}
 
-    def _get_L50_result(dw):
+    def _get_L50_result(dw, verbose=False):
         """Get L50 result, using shared cache if available."""
-        return _evaluate_L50(dw, param, lambda0, cache_dir, eval_cache)
+        if verbose:
+            print(f"[Δw* Solver] Computing mode solver for Δw={dw:.6f} µm...", flush=True)
+        result = _evaluate_L50(dw, param, lambda0, cache_dir, eval_cache)
+        if verbose and result is not None:
+            L50_te = result['L_50_dict']['te']
+            L50_tm = result['L_50_dict']['tm']
+            print(f"[Δw* Solver] Mode solver complete: L50_TE={L50_te:.3f} µm, L50_TM={L50_tm:.3f} µm", flush=True)
+        return result
     
     def _Fnorm(dw):
         """Normalized objective: (L50_TE - L50_TM) / mean(L50)."""
@@ -383,9 +478,12 @@ def _solve_delta_w_star_newton(w, g, t, lambda0, param_template, delta_w_init=No
         return float((Lte - Ltm) / max(m, 1e-12))
 
     # Main Newton iteration loop
-    for k in tqdm(range(max_iter), desc="  Newton iteration", unit="iter", ncols=80,
-                  mininterval=0.5, leave=False):
+    print(f"[Δw* Solver] Iteration 1/{max_iter}: evaluating at Δw={delta_w_k:.6f} µm...", flush=True)
+    for k in range(max_iter):
         diagnostics['n_iterations'] = k + 1
+        
+        if k > 0:
+            print(f"[Δw* Solver] Iteration {k+1}/{max_iter}: evaluating at Δw={delta_w_k:.6f} µm...", flush=True)
 
         # Check if stuck (delta_w not changing)
         if last_delta_w is not None and abs(delta_w_k - last_delta_w) < 1e-8:
@@ -398,7 +496,8 @@ def _solve_delta_w_star_newton(w, g, t, lambda0, param_template, delta_w_init=No
         last_delta_w = delta_w_k
 
         # Evaluate F(Δw_k) and get L50 result (cached)
-        result_k = _get_L50_result(delta_w_k)
+        # Only show verbose mode solver messages for first few iterations
+        result_k = _get_L50_result(delta_w_k, verbose=(k < 3))
         if result_k is None:
             F_k = None
         else:
@@ -492,6 +591,12 @@ def _solve_delta_w_star_newton(w, g, t, lambda0, param_template, delta_w_init=No
         # Check convergence (using abs error in microns for diagnostics)
         abs_err_microns = abs(L50_te_k - L50_tm_k)
         rel_err_k = abs_err_microns / mean_L50_k if mean_L50_k > 0 else np.inf
+        
+        # Print progress every few iterations
+        if (k + 1) % 5 == 0 or k == 0:
+            print(f"[Δw* Solver] Iteration {k+1}: Δw={delta_w_k:.6f} µm, "
+                  f"|L50_TE-L50_TM|={abs_err_microns:.4f} µm (target: {abs_tol:.4f} µm)", flush=True)
+        
         if abs_err_microns <= abs_tol or rel_err_k <= rel_tol:
             diagnostics['converged'] = True
             diagnostics['abs_err'] = abs_err_microns
@@ -509,7 +614,7 @@ def _solve_delta_w_star_newton(w, g, t, lambda0, param_template, delta_w_init=No
                 diagnostics['kappa_tm'] = result_k['kappa_dict']['tm']
                 diagnostics['Delta_te'] = result_k['Delta_dict']['te']
                 diagnostics['Delta_tm'] = result_k['Delta_dict']['tm']
-            print(f"[Δw* Solver] Converged after {k+1} iterations: |L50_TE - L50_TM| = {abs_err_microns:.6f} µm", flush=True)
+            print(f"[Δw* Solver] ✓ Converged after {k+1} iterations: |L50_TE - L50_TM| = {abs_err_microns:.6f} µm", flush=True)
             return delta_w_k, diagnostics
 
         # Compute derivative on normalized objective
@@ -587,6 +692,7 @@ def _solve_delta_w_star_newton(w, g, t, lambda0, param_template, delta_w_init=No
         delta_w_k = delta_w_new
     
     # Max iterations reached - return best candidate
+    print(f"[Δw* Solver] Max iterations ({max_iter}) reached", flush=True)
     if best_candidate is not None:
         delta_w_k = best_candidate[0]
         F_k = best_candidate[1]  # normalized F, kept for reference but not used in diagnostics
@@ -606,9 +712,9 @@ def _solve_delta_w_star_newton(w, g, t, lambda0, param_template, delta_w_init=No
         
         fallback_str = diagnostics.get('fallback_used', 'none')
         if fallback_str != 'none':
-            print(f"[Δw* Solver] Max iterations ({max_iter}) reached, using {fallback_str} fallback: |L50_TE - L50_TM| = {abs_err_um:.6f} µm", flush=True)
+            print(f"[Δw* Solver] Using {fallback_str} fallback: |L50_TE - L50_TM| = {abs_err_um:.6f} µm", flush=True)
         else:
-            print(f"[Δw* Solver] Max iterations ({max_iter}) reached: |L50_TE - L50_TM| = {abs_err_um:.6f} µm", flush=True)
+            print(f"[Δw* Solver] Final result: |L50_TE - L50_TM| = {abs_err_um:.6f} µm", flush=True)
         
         # Compute final derivative for diagnostics
         F_prime_final = _F_prime_of_dw(delta_w_k, h, param, lambda0, cache_dir, eps_min, eval_cache=eval_cache)

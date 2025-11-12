@@ -430,35 +430,64 @@ def write_csv(results: Sequence[GeometryResult], path: str) -> None:
     ]
     csv_path = pathlib.Path(path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Read existing data to preserve it
+    existing_results = {}
+    if csv_path.exists():
+        try:
+            with csv_path.open("r", newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    try:
+                        key = (round(float(row["w_um"]), 6), 
+                               round(float(row["g_um"]), 6), 
+                               round(float(row["t_um"]), 6))
+                        existing_results[key] = row
+                    except (KeyError, ValueError):
+                        continue
+        except Exception:
+            # If reading fails, start fresh
+            existing_results = {}
+    
+    # Merge new results with existing (new results overwrite old ones for same geometry)
+    for res in results:
+        key = (round(float(res.w), 6), round(float(res.g), 6), round(float(res.t), 6))
+        bracket = res.sign_scan.bracket_hint or (None, None)
+        existing_results[key] = {
+            "w_um": res.w,
+            "g_um": res.g,
+            "t_um": res.t,
+            "sign_change": res.sign_scan.has_sign_change,
+            "sign_samples": res.sign_scan.sample_points,
+            "sign_skipped": res.sign_scan.skipped_points,
+            "bracket_start_um": bracket[0],
+            "bracket_end_um": bracket[1],
+            "delta_w_star_um": res.delta_w_star,
+            "abs_err_um": res.abs_err,
+            "rel_err": res.rel_err,
+            "n_brackets": res.diagnostics.get("n_brackets", 0),
+            "tolerance_met": res.diagnostics.get("tolerance_met", False),
+            "usable_zero": res.usable_zero,
+            "fallback_reason": res.failure_reason(),
+            "best_sample_abs_err_um": res.sign_scan.best_abs_err,
+            "best_sample_dw_um": res.sign_scan.best_dw,
+            "ranking_score": ranking_score(res),
+            "L50_te_um": res.diagnostics.get("L50_te", np.nan),
+            "L50_tm_um": res.diagnostics.get("L50_tm", np.nan),
+        }
+    
+    # Convert back to GeometryResult-like objects for sorting, then write
+    # We'll create a simple dict-based sorting
+    all_rows = list(existing_results.values())
+    # Sort by ranking_score (convert to float, handle missing values)
+    all_rows.sort(key=lambda r: float(r.get("ranking_score", 1e9) if r.get("ranking_score") not in (None, "", "nan") else 1e9))
+    
+    # Write all results back to file
     with csv_path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
-        for res in sorted(results, key=ranking_score):
-            bracket = res.sign_scan.bracket_hint or (None, None)
-            writer.writerow(
-                {
-                    "w_um": res.w,
-                    "g_um": res.g,
-                    "t_um": res.t,
-                    "sign_change": res.sign_scan.has_sign_change,
-                    "sign_samples": res.sign_scan.sample_points,
-                    "sign_skipped": res.sign_scan.skipped_points,
-                    "bracket_start_um": bracket[0],
-                    "bracket_end_um": bracket[1],
-                    "delta_w_star_um": res.delta_w_star,
-                    "abs_err_um": res.abs_err,
-                    "rel_err": res.rel_err,
-                    "n_brackets": res.diagnostics.get("n_brackets", 0),
-                    "tolerance_met": res.diagnostics.get("tolerance_met", False),
-                    "usable_zero": res.usable_zero,
-                    "fallback_reason": res.failure_reason(),
-                    "best_sample_abs_err_um": res.sign_scan.best_abs_err,
-                    "best_sample_dw_um": res.sign_scan.best_dw,
-                    "ranking_score": ranking_score(res),
-                    "L50_te_um": res.diagnostics.get("L50_te", np.nan),
-                    "L50_tm_um": res.diagnostics.get("L50_tm", np.nan),
-                }
-            )
+        for row in all_rows:
+            writer.writerow(row)
 
 
 # ---------------------------------------------------------------------------
