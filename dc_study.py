@@ -24,6 +24,7 @@ from simulation_utils import (
 from building_utils import generate_object, update_param_derived
 import matplotlib.pyplot as plt
 from material_dispersion import get_permittivity_SiO2, get_permittivity_SiN
+from sweep_utils import sweep
 # import need be changed in some cases
 
 
@@ -54,10 +55,10 @@ def get_geometry_folder_name(wg_width, wg_thick, coupling_gap, blend_policy):
 
 DRY_RUN = False# set False to actually simulate
 # --- central hyperparameters (edit once, propagate everywhere) ---
-GRID_STEPS_PER_WVL_X = 6
-GRID_STEPS_PER_WVL_Y = 6
-GRID_STEPS_PER_WVL_Z = 10
-RUN_TIME = 1e-11 #s
+GRID_STEPS_PER_WVL_X = 8
+GRID_STEPS_PER_WVL_Y = 8
+GRID_STEPS_PER_WVL_Z = 12
+RUN_TIME = 2e-11 #s
 SHUTOFF = 1e-6#s
 SOURCE_DLAMBDA = 0.06  # µm span driving the Gaussian pulse
 SOURCE_NUM_FREQS = 20  # tidy3d validation prefers <= 20
@@ -89,6 +90,8 @@ COUPLING_BLEND_POLICY = "balance"  # How to blend TE/TM L50: "median" (default),
                                     # "balance" optimizes L_c to minimize |η_TE-0.5|+|η_TM-0.5|
 SOLVE_DELTA_W = True  # If True, solve for delta_w* to equalize L_50_TE and L_50_TM (asymmetry-first strategy)
                       # If False, use symmetric mode (delta_w=0) or manually set delta_w
+DELTA_W_MANUAL = -0.323581 #0.274024  # If set to a value (µm), use that delta_w directly and skip solving
+                       # If None, follow SOLVE_DELTA_W logic
 DELTA_W_ABS_TOL = 0.05  # Absolute tolerance for L50_TE - L50_TM matching (µm)
 DELTA_W_REL_TOL = 0.01  # Relative tolerance for L50_TE - L50_TM matching (1% = 0.01)
 DELTA_W_SEARCH_MIN = -0.6  # Primary search box minimum (µm)
@@ -107,20 +110,29 @@ USE_DISPERSIVE_MATERIALS = True  # If True, use wavelength-dependent refractive 
 
 #script parameters, input parameters for the simulation
 # Note: coupling_length will be derived from supermode analysis in update_param_derived()
-# Note: delta_w will be solved (not set) when SOLVE_DELTA_W=True (asymmetry-first strategy)
+# Note: delta_w will be solved when SOLVE_DELTA_W=True (asymmetry-first strategy)
+#       If DELTA_W_MANUAL is set, that value will be used directly instead
 sbend_length = 8  #µm
 sbend_height = 0.5  #µm
 wg_length = 5  #µm
-wg_width = 1.1 #µm
-wg_thick = 0.28  #µm
+wg_width = 1.08 #µm
+wg_thick = 0.275  #µm
 wl_0 = 1.55  #µm
-coupling_gap = 0.28  #µm
+coupling_gap = 0.255  #µm
 
 
 # Optional fine-tuning parameters for L_c (only if needed)
-ENABLE_L_FINE_TUNE = True  # Set True to add trim-factor sweep around derived L_c
+ENABLE_L_FINE_TUNE = False  # Set True to add trim-factor sweep around derived L_c
 L_TUNE_TRIM_RANGE = (-0.15, 0.15)  # Fractional trim offsets (e.g., ±15%)
 L_TUNE_POINTS = 6  # Number of trim samples within the range
+
+# --- Sweep parameters (t, w, g) ---
+ENABLE_SWEEP = False # Set True to enable parameter sweep over thickness, width, and gap
+SWEEP_THICK_RANGE = (0.27, 0.28, 0.005)  # (min, max, step) thickness values to sweep (µm)
+SWEEP_WIDTH_RANGE = (1.065, 1.08, 0.005)  # (min, max, step) width values to sweep (µm)
+SWEEP_GAP_RANGE = (0.25, 0.27, 0.005)  # (min, max, step) gap values to sweep (µm)
+SWEEP_LENGTH = None  # Optional list of coupling_length values for fine-tuning (None for derived-only)
+SWEEP_OUTDIR = "results/sweeps_fixed_delta_w"  # Output directory for sweep CSV
 
 #calculate the size of the simulation domain (coupling_length will be computed later)
 size_x = 2*(wg_length+sbend_length) + 0.0  # Will be computed from derived coupling_length
@@ -380,11 +392,27 @@ if not DRY_RUN:
                     print(f"[RESULTS] Moved {file_path.name} to {RESULTS_DIR}")
 
 # Compute derived coupling_length before building geometry
-# If SOLVE_DELTA_W=True, delta_w* will be solved to equalize L_50_TE and L_50_TM
+# If DELTA_W_MANUAL is set, use that value directly; otherwise follow SOLVE_DELTA_W logic
 # Skip if being imported by tune_geometry.py to avoid unnecessary computation
 _is_tune_geometry_import = any('tune_geometry' in str(frame.filename) for frame in __import__('inspect').stack())
 if not _is_tune_geometry_import:
-    update_param_derived(param, solve_delta_w=SOLVE_DELTA_W)
+    if DELTA_W_MANUAL is not None:
+        # Use manually specified delta_w
+        param.delta_w = DELTA_W_MANUAL
+        w = float(param.wg_width)
+        g = float(param.coupling_gap)
+        t = float(param.wg_thick)
+        print(f"\n{'='*80}")
+        print(f"[Δw* Manual] ✓ MANUAL VALUE SET")
+        print(f"{'─'*80}")
+        print(f"  Geometry:  w={w:.2f} µm, g={g:.3f} µm, t={t:.3f} µm")
+        print(f"  Δw:        {DELTA_W_MANUAL:+.4f} µm (manually specified)")
+        print(f"  Note:      Skipping delta_w* optimization")
+        print(f"{'='*80}\n")
+        update_param_derived(param, solve_delta_w=False)
+    else:
+        # Follow SOLVE_DELTA_W logic
+        update_param_derived(param, solve_delta_w=SOLVE_DELTA_W)
     generate_object_result = generate_object(param)
     generate_object_result = generate_object_result if isinstance(generate_object_result, list) else [generate_object_result]
 else:
@@ -454,6 +482,55 @@ def run_single(param, pol='te', task_tag='single', dry_run=False, lambda_single=
 
 if __name__ == "__main__":
 
+    # Check if sweep mode is enabled
+    if ENABLE_SWEEP:
+        # Helper function to convert (min, max, step) tuple to array
+        def _build_sweep_range(range_tuple):
+            """Convert (min, max, step) tuple to numpy array, ensuring values don't exceed max."""
+            min_val, max_val, step = range_tuple
+            # Generate values starting from min_val, stepping by step
+            # Stop before exceeding max_val (np.arange stops before the stop value)
+            # Add a small epsilon to include max_val if it's exactly reachable
+            values = np.arange(min_val, max_val + step * 1e-6, step)
+            # Filter out values that exceed max_val (with small tolerance for floating point)
+            values = values[values <= max_val + 1e-10]
+            return np.round(values, 4)
+        
+        # Convert range tuples to arrays
+        grid_thick = _build_sweep_range(SWEEP_THICK_RANGE)
+        grid_width = _build_sweep_range(SWEEP_WIDTH_RANGE)
+        grid_gap = _build_sweep_range(SWEEP_GAP_RANGE)
+        
+        # Parameter sweep over t, w, g
+        print(f"\n[SWEEP MODE] Starting parameter sweep")
+        print(f"  Thickness range: {SWEEP_THICK_RANGE[0]:.3f} to {SWEEP_THICK_RANGE[1]:.3f} µm (step={SWEEP_THICK_RANGE[2]:.3f})")
+        print(f"  Width range: {SWEEP_WIDTH_RANGE[0]:.3f} to {SWEEP_WIDTH_RANGE[1]:.3f} µm (step={SWEEP_WIDTH_RANGE[2]:.3f})")
+        print(f"  Gap range: {SWEEP_GAP_RANGE[0]:.3f} to {SWEEP_GAP_RANGE[1]:.3f} µm (step={SWEEP_GAP_RANGE[2]:.3f})")
+        if SWEEP_LENGTH is not None:
+            print(f"  Length fine-tuning: {SWEEP_LENGTH}")
+        
+        # Create a copy of param for sweep (will be modified during sweep)
+        sweep_param = copy.deepcopy(param)
+        
+        # Run sweep
+        sweep(
+            grid_gap=grid_gap,
+            grid_width=grid_width,
+            grid_thick=grid_thick,
+            grid_length=SWEEP_LENGTH,
+            param=sweep_param,
+            weights=WEIGHTS,
+            run_single_fn=run_single,
+            dry_run=DRY_RUN,
+            save_top_k=10,
+            outdir=SWEEP_OUTDIR,
+            lambda_single=None,
+            delta_w_manual=DELTA_W_MANUAL,  # Pass manual delta_w if set
+        )
+        
+        print(f"\n[SWEEP MODE] Sweep completed")
+        exit(0)  # Exit after sweep, don't run single simulation
+
     results_cache = {}
 
     # single TE/TM run (with optional L_c fine-tune via trim offsets)
@@ -465,9 +542,10 @@ if __name__ == "__main__":
     best_entry = None  # (metric, trim, param_state, results_cache)
 
     trial_records = []
+    first_iteration = True
     for trim in trim_values:
-        # Check if this trim was already computed
-        existing_entry = _trim_already_computed(GEOMETRY_FOLDER_NAME, trim) if not DRY_RUN else None
+        # Check if this trim was already computed (only skip if fine-tuning is enabled)
+        existing_entry = _trim_already_computed(GEOMETRY_FOLDER_NAME, trim) if (not DRY_RUN and ENABLE_L_FINE_TUNE) else None
         if existing_entry is not None:
             print(f"[L_c Fine Tune] Skipping trim_offset={trim:+.3f} (already computed, score={existing_entry.get('score', 'N/A')})")
             # Still update the log to ensure it's sorted (refresh timestamp)
@@ -496,8 +574,17 @@ if __name__ == "__main__":
         
         trial_param = copy.deepcopy(base_param_snapshot)
         trial_param.coupling_trim_factor = base_trim + trim
-        update_param_derived(trial_param, solve_delta_w=SOLVE_DELTA_W)
+        if DELTA_W_MANUAL is not None:
+            # Use manually specified delta_w
+            trial_param.delta_w = DELTA_W_MANUAL
+            if first_iteration:
+                print(f"[Δw* Manual] Using manually specified Δw = {DELTA_W_MANUAL:+.4f} µm (skipping optimization)")
+            update_param_derived(trial_param, solve_delta_w=False)
+        else:
+            # Follow SOLVE_DELTA_W logic
+            update_param_derived(trial_param, solve_delta_w=SOLVE_DELTA_W)
         trial_results = {}
+        first_iteration = False
         # Only use lambda_single during fine-tuning (when multiple trim values)
         use_lambda_single = ENABLE_L_FINE_TUNE and not DRY_RUN and len(trim_values) > 1
         lambda_arg = wl_0 if use_lambda_single else None
